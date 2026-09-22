@@ -1,9 +1,17 @@
+<p align="center">
+  <img src="docs/icon.png" width="128" height="128" alt="Chroma app icon">
+</p>
+
 # Chroma
 
-A macOS calendar over the iCloud calendar named **Calendar**, with the one
-feature Apple's own app refuses to have: per-event colours. Day, week, month and
-year views. Builds with the Swift compiler from the Command Line Tools — no
-Xcode project, no dependencies.
+A macOS calendar over EventKit, with the one feature Apple's own app refuses
+to have: per-event colours. Day, week, month and year views. Builds with the
+Swift compiler from the Command Line Tools — no Xcode project, no
+dependencies.
+
+![Chroma cycling through its Day, Week, Month, and Year views, showing invented sample events in per-event colour](docs/demo.gif)
+
+*Sample data throughout — not a real calendar.*
 
 ## Build
 
@@ -24,9 +32,13 @@ a different app.
 
 ## What it does
 
-**One calendar.** It reads and writes the calendar titled `Calendar` and ignores
-everything else in the account. Change `targetCalendarTitle` in
-`Sources/EventStore.swift` to point it elsewhere.
+**One calendar.** It reads and writes a single calendar and ignores everything
+else in the account — titled `Calendar` by default. Point it at a different
+calendar (a synced Google account, say, whose EventKit title is usually that
+account's email address) by setting `localCalendarTitle` in
+`Sources/LocalConfig.swift`, which you create from `LocalConfig.swift.example`.
+That file is git-ignored, so your real calendar name never ends up in source
+control.
 
 **Live in both directions.** There is no sync layer, because there is nothing to
 sync: the app talks to the same EventKit database Calendar.app does. An event
@@ -39,19 +51,26 @@ into columns the way Google Calendar does it and a live "now" line. Month is a
 six-week grid that never changes height. Year is twelve mini months; click a day
 to drop into it.
 
-**Categories.** Every event belongs to one of seven categories, each with its own
-pigment. They are matched by title in `Sources/Categories.swift` — edit the
-patterns there to reshape the scheme, nothing else needs to change.
+**Categories.** Every event belongs to one category, each with its own pigment,
+matched by title. `Sources/Categories.swift` ships a small generic rule set
+(`defaultCategories`) so the app is useful out of the box:
 
 | Category | Pigment |
 | --- | --- |
 | Deadlines & assignments | Vermilion |
 | Classes | Cerulean |
+| Professor office hours | Sap Green |
 | Office hours & advising | Verdigris |
 | Professional meetings | Ultramarine |
 | Club meetings | Amber |
 | Campus events | Ochre |
 | Social | Magenta |
+
+Your own rules — real course numbers, professors, clubs, employers — belong in
+`localCategories` in `Sources/LocalConfig.swift` instead of in
+`Categories.swift`. When set, it overrides the default list entirely, and
+because that file is git-ignored, none of it reaches source control. See
+`LocalConfig.swift.example` for the shape.
 
 Categorising happens on its own: the first reload after launch covers the whole
 calendar, and every reload after that catches whatever just arrived — from
@@ -105,6 +124,8 @@ is what the `.ics` export could not manage.
 | `⌥Space` | Same, from any app — brings Chroma forward first |
 | `⌃Space` | Ask Claude, from any app |
 | `⌘F` | Search events |
+| `⇧⌘K` | Organize › Assign Categories to Everything |
+| `⇧⌘O` | Toggle TA & Advising Hours |
 | `⌘T` | Today |
 | `⌘←` / `⌘→` | Previous / next period |
 
@@ -155,10 +176,13 @@ since editing a repeating event applies to the series either way.
 
 | File | Holds |
 | --- | --- |
-| `Sources/EventStore.swift` | EventKit access, fetching, create/update/delete |
+| `Sources/EventStore.swift` | EventKit access, fetching, create/update/delete, search ranking |
+| `Sources/Categories.swift` | The category rules and the colouring pass |
+| `Sources/Recurrence.swift` | The repeat control shared by the create and edit panes |
 | `Sources/ViewMode.swift` | The four zoom levels and their date maths |
 | `Sources/Theme.swift` | Design tokens, the mode picker, the glyph button |
 | `Sources/EventColors.swift` | The colour palette and its sidecar file |
+| `Sources/EventChip.swift` | The pale-block-with-pigment-spine event treatment |
 | `Sources/EventLayout.swift` | Column packing for overlapping events |
 | `Sources/ContentView.swift` | Window chrome, sidebar, search, agenda |
 | `Sources/DetailPane.swift` | The inspector, read and edit |
@@ -167,8 +191,12 @@ since editing a repeating event applies to the series either way.
 | `Sources/TimeGridView.swift` | Day and week grids |
 | `Sources/MiniMonth.swift` | Mini months and the year view |
 | `Sources/ClaudePanel.swift` | The Claude popup and its CLI runner |
+| `Sources/ClaudePlan.swift` | Parses Claude's reply and applies it through EventKit |
 | `Sources/GlobalHotKey.swift` | Carbon system-wide shortcuts |
 | `Sources/ChromaApp.swift` | Entry point, menus, hotkey registration |
+| `Sources/LocalConfig.swift` | Your real calendar title and category rules — git-ignored |
+| `tools/MakeIcon.swift` | Renders the app icon |
+| `tools/RenderReadmeArt.swift` | Renders the images in this README from synthetic sample data |
 
 ## Known limits
 
@@ -193,9 +221,9 @@ swatch card shows its colour. The spine is deliberate: tinted fills wash out at
 the sizes a month grid forces, but three saturated pixels hold their hue at any
 size.
 
-Pigments are named as pigments — Vermilion, Amber, Ochre, Verdigris, Cerulean,
-Ultramarine, Magenta, Payne's Grey — because naming them properly is most of
-what makes choosing one feel like a decision. Their stored ids are unchanged
+Pigments are named as pigments — Vermilion, Amber, Ochre, Verdigris, Sap Green,
+Cerulean, Ultramarine, Magenta, Payne's Grey — because naming them properly is
+most of what makes choosing one feel like a decision. Their stored ids are unchanged
 from the first version, so renaming them orphaned nothing. Untagged events are a
 neutral slate: if they were coloured, colour would stop meaning anything.
 
