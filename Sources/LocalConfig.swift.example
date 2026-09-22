@@ -1,0 +1,13 @@
+import Foundation
+
+/// Copy this file to `LocalConfig.swift` (git-ignored) and set this to the
+/// exact title EventKit shows for the calendar you want Chroma to use — for a
+/// synced Google calendar, that's usually the Google account's email address.
+/// Leave it `nil` to fall back to a calendar literally named "Calendar".
+let localCalendarTitle: String? = nil
+
+/// Set this to your own category rules — the actual courses, professors,
+/// clubs, and employers you want Chroma to recognise. See `Categories.swift`
+/// for the `EventCategory` shape and `Categories.defaultCategories` for an
+/// example. Leave `nil` to use those generic defaults.
+let localCategories: [EventCategory]? = nil
