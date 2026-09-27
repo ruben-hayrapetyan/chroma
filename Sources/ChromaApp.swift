@@ -119,18 +119,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // these are clear.
         claudeHotKey = GlobalHotKey(keyCode: UInt32(kVK_Space),
                                     modifiers: UInt32(controlKey)) { [weak intents] in
-            NSApp.activate(ignoringOtherApps: true)
-            intents?.claudeRequested = true
+            AppDelegate.showWindow { intents?.claudeRequested = true }
         }
 
         newEventHotKey = GlobalHotKey(keyCode: UInt32(kVK_Space),
                                       modifiers: UInt32(optionKey)) { [weak intents] in
-            NSApp.activate(ignoringOtherApps: true)
-            intents?.newEventRequested = true
+            AppDelegate.showWindow { intents?.newEventRequested = true }
         }
     }
 
+    /// ⌘W closes the window but leaves the app running; only ⌘Q quits.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    /// Brings the app forward, reopening its window if ⌘W closed it, then runs
+    /// `action`. A reopened window needs a moment before its view is listening
+    /// for intents, so the action is deferred in that case.
+    @MainActor
+    static func showWindow(then action: @escaping @MainActor () -> Void) {
+        let hasWindow = NSApp.windows.contains { $0.canBecomeMain && ($0.isVisible || $0.isMiniaturized) }
+        NSApp.activate(ignoringOtherApps: true)
+        if hasWindow {
+            action()
+        } else {
+            // Opening our own bundle while running sends the standard "reopen"
+            // event, which makes SwiftUI create a fresh window.
+            NSWorkspace.shared.open(Bundle.main.bundleURL)
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                action()
+            }
+        }
     }
 }
