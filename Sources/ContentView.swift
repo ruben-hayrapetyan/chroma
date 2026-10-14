@@ -4,6 +4,8 @@ struct ContentView: View {
     @EnvironmentObject var store: EventStore
     @EnvironmentObject var colors: EventColors
     @EnvironmentObject var intents: Intents
+    @ObservedObject private var rules = RuleBook.shared
+    @Environment(\.openSettings) private var openSettings
 
     @State private var askingClaude = false
 
@@ -115,9 +117,7 @@ struct ContentView: View {
         case .denied(let reason):
             notice("No calendar access", detail: reason, symbol: "lock.fill")
         case .granted where store.targetCalendar == nil:
-            notice("Can't find the calendar",
-                   detail: "No calendar named \"\(targetCalendarTitle)\" exists in your account. If you renamed it, either rename it back or change targetCalendarTitle in EventStore.swift.",
-                   symbol: "questionmark.folder")
+            CalendarChooser()
         case .granted:
             main
         }
@@ -199,12 +199,13 @@ struct ContentView: View {
         }
     }
 
-    /// Double-clicking an event goes straight to editing it.
+    /// Double-clicking an event goes straight to editing it — unless its
+    /// calendar is read-only, when it just opens.
     private func edit(_ item: EventItem) {
         withAnimation(.snappy(duration: 0.2)) {
             intents.draft = nil
             selectedID = item.id
-            editingSelection = true
+            editingSelection = item.isEditable
         }
     }
 
@@ -257,7 +258,9 @@ struct ContentView: View {
 
                 todayButton(labelled: showsTodayLabel)
 
-                supportHoursButton
+                filterButton
+                calendarsMenu
+                pinnedCalendarButtons
 
                 Spacer(minLength: 8)
 
@@ -274,20 +277,74 @@ struct ContentView: View {
         .frame(height: 58)
     }
 
-    /// Shows or hides the TA, GTA and advising drop-in sessions. In the toolbar
-    /// rather than only in the View menu because it is the one setting worth
-    /// flipping several times a day, depending on whether you are looking for
-    /// help or looking at your week.
-    private var supportHoursButton: some View {
-        GlyphButton(
-            systemName: store.showSupportingOfficeHours
-                ? "person.2.fill" : "person.2.slash.fill",
-            help: store.showSupportingOfficeHours
-                ? "Hide TA & advising hours (⇧⌘O)"
-                : "Show TA & advising hours (⇧⌘O)"
-        ) {
-            store.showSupportingOfficeHours.toggle()
+    /// Shows or hides whatever the filter in `categories.json` matches. In the
+    /// toolbar rather than only in the View menu because it is the one setting
+    /// worth flipping several times a day. Absent when there is no filter.
+    @ViewBuilder
+    private var filterButton: some View {
+        if let filter = rules.rules.filter {
+            GlyphButton(
+                systemName: store.showFilteredEvents ? "eye" : "eye.slash",
+                help: "\(store.showFilteredEvents ? "Hide" : "Show") \(filter.label) (⇧⌘O)"
+            ) {
+                store.showFilteredEvents.toggle()
+            }
         }
+    }
+
+    /// The calendars connected in Settings, each switched on and off here, and
+    /// the way to connect more. Always present, since it is also how someone
+    /// new finds out other calendars can be shown at all.
+    private var calendarsMenu: some View {
+        let anyShown = store.extraCalendars.contains(where: \.isShown)
+        return Menu {
+            ForEach(store.extraCalendars) { extra in
+                Toggle(store.resolve(extra.ref) == nil
+                           ? "\(extra.ref.title) — not on this Mac"
+                           : extra.ref.title,
+                       isOn: Binding(get: { extra.isShown },
+                                     set: { store.setShown(extra.id, $0) }))
+            }
+            if !store.extraCalendars.isEmpty { Divider() }
+            Button("Connect Calendars…") { openSettings() }
+        } label: {
+            Image(systemName: anyShown ? "square.stack.fill" : "square.stack")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.ink.opacity(0.8))
+                .frame(width: 26, height: 24)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.rule, lineWidth: 0.5)
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Other calendars")
+    }
+
+    /// Connected calendars given a button of their own in Settings: one click
+    /// to show or hide, where the stack menu takes two.
+    private var pinnedCalendarButtons: some View {
+        ForEach(Array(store.extraCalendars.enumerated()), id: \.element.id) { index, extra in
+            if extra.inToolbar {
+                CalendarToggleButton(
+                    title: extra.ref.title,
+                    color: swatchColor(for: extra),
+                    isShown: extra.isShown,
+                    shortcut: index < 9 ? "⌥⌘\(index + 1)" : nil
+                ) {
+                    store.setShown(extra.id, !extra.isShown)
+                }
+            }
+        }
+    }
+
+    /// The pigment a calendar's events wear when it has one, otherwise the
+    /// calendar's own colour. Nil when it isn't on this Mac.
+    private func swatchColor(for extra: ExtraCalendar) -> Color? {
+        if let pigment = EventColor.named(extra.colorID) { return pigment.color }
+        return store.resolve(extra.ref).map { Color(cgColor: $0.cgColor) }
     }
 
     private func heading(pinned: Bool) -> some View {
@@ -407,9 +464,10 @@ struct Sidebar: View {
                 Text("Chroma")
                     .font(.system(size: 17, weight: .semibold, design: .serif))
                     .foregroundStyle(Theme.ink)
-                Text(calendarDisplayName.uppercased())
+                Text(store.accountLabel.uppercased())
                     .font(Theme.eyebrow)
                     .foregroundStyle(Theme.faint)
+                    .lineLimit(1)
                 Spacer()
             }
             .padding(.top, 16)
@@ -423,7 +481,13 @@ struct Sidebar: View {
             } else {
                 VStack(spacing: 7) {
                     actionButton("New Event", symbol: "plus", prominent: true, action: onNewEvent)
+                    // Needs the user's own Claude Code install; without it the
+                    // button says so rather than opening a panel that can't send.
+                    let hasClaude = ClaudeRunner.executable != nil
                     actionButton("Ask Claude", symbol: "sparkles", prominent: false, action: onAskClaude)
+                        .disabled(!hasClaude)
+                        .opacity(hasClaude ? 1 : 0.45)
+                        .help(hasClaude ? "Ask Claude (⌃Space)" : ClaudeRunner.missingMessage)
                 }
 
                 MiniMonth(month: store.anchor,

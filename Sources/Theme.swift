@@ -155,6 +155,50 @@ struct ModePicker: View {
     }
 }
 
+/// A connected calendar's own toolbar button: its swatch, solid while the
+/// calendar is shown and hollow while it isn't. The same frame and hairline as
+/// `GlyphButton`, so it sits in the row as one of them — the swatch is the only
+/// colour, and it is the calendar's, not the chrome's.
+struct CalendarToggleButton: View {
+    let title: String
+    /// Nil when the calendar isn't on this Mac, which draws it in faint ink.
+    let color: Color?
+    let isShown: Bool
+    let shortcut: String?
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        let swatch = color ?? Theme.faint
+        Button(action: action) {
+            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                .fill(isShown ? swatch : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                        .strokeBorder(swatch, lineWidth: 1.5)
+                )
+                .frame(width: 11, height: 11)
+                .frame(width: 26, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(hovering ? Theme.wash : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.rule, lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(color == nil
+              ? "\(title) isn't on this Mac"
+              : "\(isShown ? "Hide" : "Show") \(title)\(shortcut.map { " (\($0))" } ?? "")")
+        .accessibilityLabel(title)
+        .accessibilityValue(isShown ? "Shown" : "Hidden")
+    }
+}
+
 /// A square icon button with a hairline edge — the chevrons and toolbar glyphs.
 struct GlyphButton: View {
     let systemName: String

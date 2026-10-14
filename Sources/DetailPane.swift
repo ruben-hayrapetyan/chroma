@@ -63,8 +63,8 @@ struct DetailPane: View {
             Button("Delete", role: .destructive) { performDelete() }
         } message: {
             Text(item.isRecurring
-                 ? "This and all later occurrences will be removed from your \"\(targetCalendarTitle)\" calendar and from iCloud."
-                 : "It will be removed from your \"\(targetCalendarTitle)\" calendar and from iCloud.")
+                 ? "This and all later occurrences will be removed from \"\(item.calendarTitle)\" and every device it syncs to."
+                 : "It will be removed from \"\(item.calendarTitle)\" and every device it syncs to.")
         }
     }
 
@@ -133,6 +133,9 @@ struct DetailPane: View {
             }
             if item.isRecurring {
                 field("Repeats", systemImage: "repeat", value: "Part of a repeating series")
+            }
+            if item.calendarID != store.targetCalendar?.calendarIdentifier {
+                field("Calendar", systemImage: "calendar", value: item.calendarTitle)
             }
             if !item.notes.isEmpty {
                 field("Notes", systemImage: "text.alignleft", value: item.notes)
@@ -247,12 +250,19 @@ struct DetailPane: View {
                 .tint(Theme.accent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
-            } else {
+            } else if item.isEditable {
                 Button("Delete", role: .destructive) { confirmingDelete = true }
                 Spacer()
                 Button("Edit") { isEditing = true }
                     .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
+            } else {
+                // Subscriptions and calendars shared view-only: EventKit would
+                // refuse the save, so there is nothing to offer but the colour.
+                Label("\(item.calendarTitle) is read-only", systemImage: "lock")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.graphite)
+                Spacer()
             }
         }
         .padding(14)

@@ -34,15 +34,19 @@ final class ClaudeRunner: ObservableObject {
         return folder
     }
 
+    /// Checked each time rather than once, so installing Claude Code while
+    /// Chroma is open works without a relaunch.
     static var executable: URL? {
         candidatePaths.first { FileManager.default.isExecutableFile(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
     }
 
+    static let missingMessage = "Ask Claude needs Claude Code installed and signed in. Chroma looks for the claude command in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin."
+
     func run(prompt: String, day: Date, calendarName: String, snapshot: String) {
         guard !isRunning else { return }
         guard let executable = Self.executable else {
-            failure = "Couldn't find the claude CLI. Looked in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin."
+            failure = Self.missingMessage
             return
         }
 
@@ -132,7 +136,9 @@ final class ClaudeRunner: ObservableObject {
         Their calendar for the year around that day — five months back, seven \
         ahead — numbered so you can refer to an entry. A line marked "repeats" \
         stands for the whole series and shows its first occurrence; changing one \
-        changes the series.
+        changes the series. A line marked "read-only" is on another calendar, \
+        shown so you know what the day holds: never update or delete one, and \
+        say so if asked to.
         \(snapshot)
 
         Categories — every event you create needs one, chosen by you unless the \
@@ -148,7 +154,7 @@ final class ClaudeRunner: ObservableObject {
 
         Each operation is one of:
         - {"op":"create","title":"…","start":"2026-09-08T15:00","end":"2026-09-08T16:00",
-           "category":"advising","location":"…","notes":"…","allDay":false}
+           "category":"\(Categories.all.first?.slug ?? "…")","location":"…","notes":"…","allDay":false}
         - {"op":"update","ref":12,"start":"…","title":"…"}  — ref is the #n above; \
         include only the fields that change
         - {"op":"delete","ref":12}
@@ -220,7 +226,14 @@ struct ClaudePanel: View {
                 .focused($promptFocused)
                 .padding(.horizontal, 20)
 
-            if !runner.transcript.isEmpty || runner.isRunning
+            if ClaudeRunner.executable == nil {
+                Label(ClaudeRunner.missingMessage, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+            } else if !runner.transcript.isEmpty || runner.isRunning
                 || runner.failure != nil || !applied.isEmpty {
                 transcriptArea
             }
@@ -336,7 +349,8 @@ struct ClaudePanel: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                 .help("Send to Claude (⌘↩)")
-                .disabled(runner.isRunning || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(runner.isRunning || ClaudeRunner.executable == nil
+                          || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(16)
     }
@@ -350,7 +364,7 @@ struct ClaudePanel: View {
         promptFocused = true
         snapshot = buildSnapshot()
         runner.run(prompt: request, day: store.selectedDay,
-                   calendarName: targetCalendarTitle,
+                   calendarName: store.targetCalendar?.title ?? "",
                    snapshot: snapshotText(snapshot))
     }
 
@@ -395,6 +409,7 @@ struct ClaudePanel: View {
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")
         clock.dateFormat = "HH:mm"
+        let mainID = store.targetCalendar?.calendarIdentifier
 
         return items.enumerated().map { index, item in
             let when = item.isAllDay
@@ -403,7 +418,8 @@ struct ClaudePanel: View {
             let place = item.location.isEmpty ? "" : " · \(item.location)"
             let repeats = item.isRecurring ? " · repeats" : ""
             let tag = Categories.category(for: item).map { " [\($0.slug)]" } ?? ""
-            return "        #\(index + 1)  \(when)  \(item.title)\(place)\(repeats)\(tag)"
+            let elsewhere = item.calendarID == mainID ? "" : " · read-only, on \"\(item.calendarTitle)\""
+            return "        #\(index + 1)  \(when)  \(item.title)\(place)\(repeats)\(elsewhere)\(tag)"
         }.joined(separator: "\n")
     }
 

@@ -159,6 +159,7 @@ enum PlanApplier {
         guard let series = resolve(operation.ref, in: snapshot) else {
             return "Couldn't find the event to change."
         }
+        guard isOnMain(series, store: store) else { return leftAlone(series) }
         // A single named date edits that occurrence only.
         let single = operation.occurrences?.compactMap(date).first
             .flatMap { store.occurrence(ofSeries: series.seriesID, on: $0) }
@@ -193,6 +194,7 @@ enum PlanApplier {
         guard let item = resolve(operation.ref, in: snapshot) else {
             return "Couldn't find the event to remove."
         }
+        guard isOnMain(item, store: store) else { return leftAlone(item) }
 
         // Named dates mean single occurrences; resolved one at a time, because
         // each removal invalidates the rest of the series' fetched objects.
@@ -227,6 +229,17 @@ enum PlanApplier {
         } catch {
             return "Couldn't remove \(item.title): \(error.localizedDescription)"
         }
+    }
+
+    /// Claude changes the main calendar and nothing else. Other calendars are
+    /// in the snapshot so it can see what a day holds — and some are shared,
+    /// where a wrong guess would delete someone else's booking.
+    private static func isOnMain(_ item: EventItem, store: EventStore) -> Bool {
+        item.calendarID == store.targetCalendar?.calendarIdentifier
+    }
+
+    private static func leftAlone(_ item: EventItem) -> String {
+        "Left \(item.title) alone — it's on \u{201C}\(item.calendarTitle)\u{201D}, which Claude can't change."
     }
 
     private static func resolve(_ ref: Int?, in snapshot: [EventItem]) -> EventItem? {

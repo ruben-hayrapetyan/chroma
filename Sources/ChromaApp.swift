@@ -54,6 +54,7 @@ struct ChromaApp: App {
     @StateObject private var store = EventStore()
     @StateObject private var colors = EventColors()
     @StateObject private var intents = Intents()
+    @ObservedObject private var rules = RuleBook.shared
 
     var body: some Scene {
         WindowGroup("Calendar") {
@@ -70,6 +71,7 @@ struct ChromaApp: App {
                     .keyboardShortcut("n", modifiers: .command)
                 Button("Ask Claude…") { intents.claudeRequested = true }
                     .keyboardShortcut(.space, modifiers: .control)
+                    .disabled(ClaudeRunner.executable == nil)
             }
             CommandGroup(after: .textEditing) {
                 Button("Find Event…") { intents.searchRequested = true }
@@ -85,8 +87,21 @@ struct ChromaApp: App {
                         .keyboardShortcut(mode.shortcut, modifiers: .command)
                 }
                 Divider()
-                Toggle("Show TA & Advising Hours", isOn: $store.showSupportingOfficeHours)
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                if let filter = rules.rules.filter {
+                    Toggle("Show \(filter.label)", isOn: $store.showFilteredEvents)
+                        .keyboardShortcut("o", modifiers: [.command, .shift])
+                }
+                // ⌥⌘1–9 for the first nine connected calendars, beside the
+                // ⌘1–4 that pick the view.
+                ForEach(Array(store.extraCalendars.enumerated()), id: \.element.id) { index, extra in
+                    Toggle("Show \(extra.ref.title)",
+                           isOn: Binding(get: { extra.isShown },
+                                         set: { store.setShown(extra.id, $0) }))
+                        .keyboardShortcut(index < 9
+                            ? KeyboardShortcut(KeyEquivalent(Character("\(index + 1)")),
+                                               modifiers: [.command, .option])
+                            : nil)
+                }
                 Divider()
                 Button("Today") { store.goToToday() }
                     .keyboardShortcut("t", modifiers: .command)
@@ -95,6 +110,12 @@ struct ChromaApp: App {
                 Button("Next") { store.step(1) }
                     .keyboardShortcut(.rightArrow, modifiers: .command)
             }
+        }
+
+        Settings {
+            SettingsView()
+                .environmentObject(store)
+                .environmentObject(colors)
         }
     }
 }
@@ -126,6 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                       modifiers: UInt32(optionKey)) { [weak intents] in
             AppDelegate.showWindow { intents?.newEventRequested = true }
         }
+    }
+
+    /// Picks up edits to `categories.json` made in a text editor, the moment
+    /// you switch back.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        MainActor.assumeIsolated { RuleBook.shared.reloadIfChanged() }
     }
 
     /// ⌘W closes the window but leaves the app running; only ⌘Q quits.

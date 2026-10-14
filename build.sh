@@ -57,9 +57,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key> <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>Chroma reads and edits the events on your "Calendar" calendar.</string>
+    <string>Chroma shows the calendars you choose and adds and edits events on the one you pick as your main calendar.</string>
     <key>NSCalendarsUsageDescription</key>
-    <string>Chroma reads and edits the events on your "Calendar" calendar.</string>
+    <string>Chroma shows the calendars you choose and adds and edits events on the one you pick as your main calendar.</string>
 </dict>
 </plist>
 PLIST

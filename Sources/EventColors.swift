@@ -27,11 +27,24 @@ struct EventColor: Identifiable, Hashable {
         EventColor(id: "purple",   name: "Ultramarine",  color: rgb(0x4A48A0)),
         EventColor(id: "pink",     name: "Magenta",      color: rgb(0xA63F76)),
         EventColor(id: "graphite", name: "Payne's Grey", color: rgb(0x6E7A8C)),
+        EventColor(id: "violet",   name: "Cobalt Violet", color: rgb(0x8A4CB5)),
     ]
 
     static func named(_ id: String?) -> EventColor? {
         guard let id else { return nil }
         return palette.first { $0.id == id }
+    }
+
+    /// A colour as a person would write it in `categories.json`: by id
+    /// ("blue") or by pigment ("Cerulean"), in any case.
+    static func matching(_ text: String) -> EventColor? {
+        let wanted = text.trimmingCharacters(in: .whitespaces).lowercased()
+        return palette.first { $0.id == wanted || $0.name.lowercased() == wanted }
+    }
+
+    /// Every colour, for error messages and Settings: "blue (Cerulean), …".
+    static var catalogue: String {
+        palette.map { "\($0.id) (\($0.name))" }.joined(separator: ", ")
     }
 
     static func rgb(_ hex: UInt32) -> Color {

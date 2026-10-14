@@ -2,17 +2,62 @@ import Combine
 import EventKit
 import Foundation
 
-/// The single calendar this app reads and writes.
+/// A calendar chosen in Settings or on first launch.
 ///
-/// Deliberately narrow: a focused window onto the iCloud calendar named
-/// "Calendar", not a general calendar client. Everything else in the account is
-/// left alone. The actual title lives in `Sources/LocalConfig.swift`, which is
-/// git-ignored — see `LocalConfig.swift.example`.
-let targetCalendarTitle = localCalendarTitle ?? "Calendar"
+/// Remembered by identifier, with its title and account kept alongside:
+/// EventKit can hand out a new identifier after an account fully resyncs, and
+/// the names are what survive that.
+struct CalendarRef: Codable, Equatable {
+    var id: String
+    var title: String
+    var account: String
 
-/// What the sidebar calls it. The calendar's real title is an email address,
-/// which is precise and useless as a label.
-let calendarDisplayName = "Google" 
+    init(_ calendar: EKCalendar) {
+        id = calendar.calendarIdentifier
+        title = calendar.title
+        account = calendar.source?.title ?? ""
+    }
+}
+
+/// A calendar drawn alongside the main one, switched on and off from the
+/// toolbar. Nothing is ever created in it from here, though its events can
+/// still be edited when the calendar allows it.
+struct ExtraCalendar: Codable, Equatable, Identifiable {
+    var ref: CalendarRef
+    var isShown = true
+    /// One pigment for every event on it, ahead of the title rules — for a
+    /// calendar whose titles say nothing about what kind of event it is, like
+    /// room bookings. Nil leaves its events to the categories.
+    var colorID: String?
+    /// Whether it gets its own button in the toolbar, for a calendar worth
+    /// flipping on and off more often than a trip into a menu allows.
+    var inToolbar = false
+
+    var id: String { ref.id }
+
+    init(ref: CalendarRef) {
+        self.ref = ref
+    }
+
+    private enum CodingKeys: String, CodingKey { case ref, isShown, colorID, inToolbar }
+
+    /// Lenient about everything but the calendar itself, so a setting added
+    /// later doesn't make calendars connected before it unreadable.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ref = try container.decode(CalendarRef.self, forKey: .ref)
+        isShown = try container.decodeIfPresent(Bool.self, forKey: .isShown) ?? true
+        colorID = try container.decodeIfPresent(String.self, forKey: .colorID)
+        inToolbar = try container.decodeIfPresent(Bool.self, forKey: .inToolbar) ?? false
+    }
+}
+
+/// Every calendar on one account, for the pickers.
+struct CalendarGroup: Identifiable {
+    let id: String
+    let account: String
+    let calendars: [EKCalendar]
+}
 
 /// One occurrence of an event, flattened for display.
 ///
@@ -30,9 +75,16 @@ struct EventItem: Identifiable {
     let location: String
     let notes: String
     let isRecurring: Bool
+    let calendarID: String
+    let calendarTitle: String
+    /// The pigment its calendar was given in Settings, if any.
+    let calendarColorID: String?
+    /// False for subscriptions, holiday calendars, and anything shared
+    /// read-only.
+    let isEditable: Bool
     let ekEvent: EKEvent
 
-    init(_ event: EKEvent) {
+    init(_ event: EKEvent, calendarColorID: String? = nil) {
         let series = event.eventIdentifier ?? UUID().uuidString
         self.seriesID = series
         self.id = series + "@" + String(event.startDate.timeIntervalSinceReferenceDate)
@@ -43,6 +95,10 @@ struct EventItem: Identifiable {
         self.location = event.location ?? ""
         self.notes = event.notes ?? ""
         self.isRecurring = event.hasRecurrenceRules
+        self.calendarID = event.calendar?.calendarIdentifier ?? ""
+        self.calendarTitle = event.calendar?.title ?? ""
+        self.calendarColorID = calendarColorID
+        self.isEditable = event.calendar?.allowsContentModifications ?? false
         self.ekEvent = event
     }
 
@@ -61,8 +117,12 @@ struct EventItem: Identifiable {
 ///
 /// There is no syncing here in any real sense. The app talks to the same
 /// EventKit database Calendar.app does, so an edit made anywhere — this app,
-/// Calendar.app, or arriving from iCloud — is the same object. All this class
-/// does is notice and reload.
+/// Calendar.app, or arriving from iCloud or Google — is the same object. All
+/// this class does is notice and reload.
+///
+/// It works on one main calendar, picked on first launch: new events go there,
+/// and it is the only one Claude may change. Other calendars can be connected
+/// in Settings and drawn alongside it.
 @MainActor
 final class EventStore: ObservableObject {
     enum Access: Equatable {
@@ -85,17 +145,28 @@ final class EventStore: ObservableObject {
     /// from anywhere — Claude, Calendar.app, another device — get a pigment
     /// without anyone asking.
     @Published private(set) var revision = 0
-    /// Whether the TA and GTA office hours are drawn at all.
+
+    /// The calendar new events go to. Nil until one is chosen.
+    @Published private(set) var mainCalendar: CalendarRef? = EventStore.loadDefault("mainCalendar") {
+        didSet { EventStore.saveDefault(mainCalendar, "mainCalendar") }
+    }
+
+    /// Calendars drawn alongside the main one, in the order they were connected.
+    @Published private(set) var extraCalendars: [ExtraCalendar] = EventStore.loadDefault("extraCalendars") ?? [] {
+        didSet { EventStore.saveDefault(extraCalendars, "extraCalendars") }
+    }
+
+    /// Whether the events matched by the filter in `categories.json` are drawn.
     ///
-    /// Off by default: they outnumber everything else on a weekday and turn the
-    /// grid into a wall of green. The professors' own hours are never part of
-    /// this — they are the ones worth seeing.
-    @Published var showSupportingOfficeHours: Bool = UserDefaults.standard
-        .bool(forKey: "showSupportingOfficeHours") {
+    /// Off by default: a filter only exists because someone wanted those events
+    /// out of the way. With no filter defined, this does nothing. Falls back to
+    /// the setting's old name so an existing choice survives the rename.
+    @Published var showFilteredEvents: Bool = UserDefaults.standard
+        .object(forKey: "showFilteredEvents") as? Bool
+        ?? UserDefaults.standard.bool(forKey: "showSupportingOfficeHours") {
         didSet {
-            guard oldValue != showSupportingOfficeHours else { return }
-            UserDefaults.standard.set(showSupportingOfficeHours,
-                                      forKey: "showSupportingOfficeHours")
+            guard oldValue != showFilteredEvents else { return }
+            UserDefaults.standard.set(showFilteredEvents, forKey: "showFilteredEvents")
             reload()
         }
     }
@@ -112,6 +183,7 @@ final class EventStore: ObservableObject {
     let calendar = Calendar.current
     private let store = EKEventStore()
     private var observer: NSObjectProtocol?
+    private var rulesSubscription: AnyCancellable?
 
     init() {
         observer = NotificationCenter.default.addObserver(
@@ -122,11 +194,31 @@ final class EventStore: ObservableObject {
                 self?.reload()
             }
         }
+        // A new filter changes what is drawn, and new rules change what gets
+        // coloured. Deferred a turn because @Published fires before the value
+        // is stored, and the reload has to read the new one.
+        rulesSubscription = RuleBook.shared.$rules
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reload() }
         requestAccess()
     }
 
     deinit {
         if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    nonisolated private static func loadDefault<T: Decodable>(_ key: String) -> T? {
+        UserDefaults.standard.data(forKey: key)
+            .flatMap { try? JSONDecoder().decode(T.self, from: $0) }
+    }
+
+    nonisolated private static func saveDefault<T: Encodable>(_ value: T?, _ key: String) {
+        if let value, let data = try? JSONEncoder().encode(value) {
+            UserDefaults.standard.set(data, forKey: key)
+        } else {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
     }
 
     // MARK: - Access
@@ -146,9 +238,135 @@ final class EventStore: ObservableObject {
         }
     }
 
-    /// The calendar we operate on, or nil if it has been renamed or removed.
-    var targetCalendar: EKCalendar? {
-        store.calendars(for: .event).first { $0.title == targetCalendarTitle }
+    // MARK: - Calendars
+
+    /// The calendar we create in, or nil if none is chosen or it has gone.
+    var targetCalendar: EKCalendar? { mainCalendar.flatMap(resolve) }
+
+    /// What the sidebar calls the main calendar: its account, as macOS names
+    /// it — "iCloud", "Google", "Exchange". An account titled by its email
+    /// address is shortened to the service, since the address is precise and
+    /// useless as a label.
+    var accountLabel: String {
+        guard let title = targetCalendar?.source?.title else { return "" }
+        guard let at = title.firstIndex(of: "@") else { return title }
+        let domain = title[title.index(after: at)...].lowercased()
+        switch domain {
+        case "gmail.com", "googlemail.com": return "Google"
+        case "icloud.com", "me.com", "mac.com": return "iCloud"
+        case "outlook.com", "hotmail.com", "live.com": return "Outlook"
+        default: return domain
+        }
+    }
+
+    /// The calendar EventKit would create in, used to preselect the first-launch
+    /// picker.
+    var systemDefaultCalendar: EKCalendar? { store.defaultCalendarForNewEvents }
+
+    func resolve(_ ref: CalendarRef) -> EKCalendar? {
+        if let exact = store.calendar(withIdentifier: ref.id) { return exact }
+        return store.calendars(for: .event).first {
+            $0.title == ref.title && ($0.source?.title ?? "") == ref.account
+        }
+    }
+
+    /// Every calendar on this Mac, grouped by account. Accounts are kept apart
+    /// by identifier, not title, since two Google accounts are both "Google".
+    func calendarGroups(writableOnly: Bool = false) -> [CalendarGroup] {
+        let calendars = store.calendars(for: .event)
+            .filter { !writableOnly || $0.allowsContentModifications }
+        let bySource = Dictionary(grouping: calendars) { $0.source?.sourceIdentifier ?? "" }
+        return bySource.map { id, members in
+            CalendarGroup(id: id,
+                          account: members.first?.source?.title ?? "Other",
+                          calendars: members.sorted {
+                              $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                          })
+        }
+        .sorted { $0.account.localizedStandardCompare($1.account) == .orderedAscending }
+    }
+
+    func useAsMain(_ calendar: EKCalendar) {
+        mainCalendar = CalendarRef(calendar)
+        extraCalendars.removeAll { $0.id == calendar.calendarIdentifier }
+        corpusIsStale = true
+        reload()
+    }
+
+    func isConnected(_ calendar: EKCalendar) -> Bool {
+        extraCalendars.contains { $0.id == calendar.calendarIdentifier }
+    }
+
+    func connect(_ calendar: EKCalendar) {
+        guard !isConnected(calendar),
+              calendar.calendarIdentifier != targetCalendar?.calendarIdentifier else { return }
+        extraCalendars.append(ExtraCalendar(ref: CalendarRef(calendar)))
+        corpusIsStale = true
+        reload()
+    }
+
+    func disconnect(_ id: String) {
+        extraCalendars.removeAll { $0.id == id }
+        corpusIsStale = true
+        reload()
+    }
+
+    func setShown(_ id: String, _ shown: Bool) {
+        guard let index = extraCalendars.firstIndex(where: { $0.id == id }) else { return }
+        extraCalendars[index].isShown = shown
+        // A calendar newly shared on Google can be on the server before
+        // EventKit has asked for it; this nudges the accounts to sync.
+        if shown, resolve(extraCalendars[index].ref) == nil {
+            store.refreshSourcesIfNecessary()
+        }
+        corpusIsStale = true
+        reload()
+    }
+
+    func setInToolbar(_ id: String, _ inToolbar: Bool) {
+        guard let index = extraCalendars.firstIndex(where: { $0.id == id }) else { return }
+        extraCalendars[index].inToolbar = inToolbar
+    }
+
+    func setColor(_ id: String, _ colorID: String?) {
+        guard let index = extraCalendars.firstIndex(where: { $0.id == id }) else { return }
+        extraCalendars[index].colorID = colorID
+        corpusIsStale = true
+        reload()
+    }
+
+    /// Every calendar currently being drawn: the main one, plus each connected
+    /// calendar that is switched on and present on this Mac.
+    private func visibleCalendars(_ main: EKCalendar) -> [EKCalendar] {
+        [main] + extraCalendars.filter(\.isShown).compactMap { resolve($0.ref) }
+            .filter { $0.calendarIdentifier != main.calendarIdentifier }
+    }
+
+    private func makeItem(_ event: EKEvent) -> EventItem {
+        let id = event.calendar?.calendarIdentifier
+        return EventItem(event, calendarColorID: extraCalendars.first { $0.id == id }?.colorID)
+    }
+
+    /// What is on a calendar over the next month, soonest first — how the
+    /// first-launch picker makes calendars recognisable by their contents.
+    func upcoming(on calendar: EKCalendar, days: Int = 30) -> [EventItem] {
+        guard access == .granted else { return [] }
+        let now = Date()
+        let to = self.calendar.date(byAdding: .day, value: days, to: now) ?? now
+        let predicate = store.predicateForEvents(withStart: now, end: to, calendars: [calendar])
+        return store.events(matching: predicate)
+            .sorted { $0.startDate < $1.startDate }
+            .map(makeItem)
+    }
+
+    /// Every event on one connected calendar across the search window, shown
+    /// or not — what a calendar-wide colour change has to reach.
+    func allItems(on extra: ExtraCalendar) -> [EventItem] {
+        guard access == .granted, let calendar = resolve(extra.ref) else { return [] }
+        let from = self.calendar.date(byAdding: .year, value: -2, to: Date()) ?? Date()
+        let to = self.calendar.date(byAdding: .year, value: 2, to: Date()) ?? Date()
+        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: [calendar])
+        return store.events(matching: predicate).map(makeItem)
     }
 
     // MARK: - Loading
@@ -165,10 +383,11 @@ final class EventStore: ObservableObject {
         let from = self.calendar.date(byAdding: .day, value: -7, to: span.start) ?? span.start
         let to = self.calendar.date(byAdding: .day, value: 7, to: span.end) ?? span.end
 
-        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: [calendar])
+        let predicate = store.predicateForEvents(withStart: from, end: to,
+                                                 calendars: visibleCalendars(calendar))
         items = store.events(matching: predicate)
-            .map(EventItem.init)
-            .filter { showSupportingOfficeHours || !Categories.isSupportingOfficeHours($0) }
+            .map(makeItem)
+            .filter { showFilteredEvents || !Categories.isFilteredOut($0) }
             .sorted { lhs, rhs in
                 if lhs.isAllDay != rhs.isAllDay { return lhs.isAllDay }
                 return lhs.start < rhs.start
@@ -283,7 +502,7 @@ final class EventStore: ObservableObject {
     enum StoreError: LocalizedError {
         case missingCalendar
         var errorDescription: String? {
-            "No calendar named \"\(targetCalendarTitle)\" was found in your account."
+            "The calendar Chroma uses isn't on this Mac any more. Choose another in Settings."
         }
     }
 
@@ -299,8 +518,9 @@ final class EventStore: ObservableObject {
         guard corpusIsStale, access == .granted, let target = targetCalendar else { return }
         let from = calendar.date(byAdding: .year, value: -2, to: Date()) ?? Date()
         let to = calendar.date(byAdding: .year, value: 2, to: Date()) ?? Date()
-        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: [target])
-        corpus = store.events(matching: predicate).map(EventItem.init)
+        let predicate = store.predicateForEvents(withStart: from, end: to,
+                                                 calendars: visibleCalendars(target))
+        corpus = store.events(matching: predicate).map(makeItem)
         corpusIsStale = false
     }
 
