@@ -15,7 +15,7 @@ dependencies.
 
 ## Requirements
 
-- **A Mac with Apple silicon (M1 or later) running macOS 14 Sonoma or later.**
+- **A Mac running macOS 14 Sonoma or later** — Apple silicon or Intel.
   Chroma is Mac-only: there is no iPhone, iPad, Windows, Linux or web version.
   It's built entirely on macOS frameworks — EventKit for the calendar data,
   SwiftUI and AppKit for the interface, Carbon for the system-wide shortcuts —
@@ -60,8 +60,9 @@ again, since it treats each unsigned build as a new app.
 ./build.sh
 ```
 
-Produces `build/Chroma.app`, renders the icon, writes `Info.plist`, and ad-hoc
-signs the bundle. Install with:
+Produces `build/Chroma.app` — universal, for Apple silicon and Intel — renders
+the icon, writes `Info.plist`, and ad-hoc signs the bundle. `ARCHS=arm64
+./build.sh` builds for one architecture only, in half the time. Install with:
 
 ```bash
 cp -R build/Chroma.app /Applications/
@@ -70,6 +71,9 @@ cp -R build/Chroma.app /Applications/
 The first launch asks for Calendar access. Because the bundle is ad-hoc signed,
 macOS may ask again after a rebuild — the signature changes, so TCC reads it as
 a different app.
+
+`./release.sh` builds and packages `build/Chroma.zip` for a GitHub release,
+archived with `ditto` so the signature survives the download.
 
 ## What it does
 

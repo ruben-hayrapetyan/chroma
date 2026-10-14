@@ -1,6 +1,9 @@
 #!/bin/bash
-# Builds "Calendar.app" from source with the Swift compiler from the Command
-# Line Tools. No Xcode project, no dependencies.
+# Builds Chroma.app from source with the Swift compiler from the Command Line
+# Tools. No Xcode project, no dependencies.
+#
+# Universal by default, so one download runs on Apple silicon and Intel Macs
+# alike. ARCHS="arm64" ./build.sh builds just one, which halves the compile.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -19,17 +22,24 @@ echo "==> Cleaning"
 rm -rf "$BUILD_DIR"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 
-echo "==> Compiling Swift sources"
-# macOS 14 is the floor: requestFullAccessToEvents does not exist before it.
-xcrun swiftc \
-  -O \
-  -swift-version 5 \
-  -target "$(uname -m)-apple-macos14.0" \
-  -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
-  -framework EventKit \
-  -framework Carbon \
-  Sources/*.swift \
-  -o "$MACOS_DIR/$EXECUTABLE"
+ARCHS="${ARCHS:-arm64 x86_64}"
+SLICES=()
+for ARCH in $ARCHS; do
+  echo "==> Compiling Swift sources ($ARCH)"
+  # macOS 14 is the floor: requestFullAccessToEvents does not exist before it.
+  xcrun swiftc \
+    -O \
+    -swift-version 5 \
+    -target "$ARCH-apple-macos14.0" \
+    -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+    -framework EventKit \
+    -framework Carbon \
+    Sources/*.swift \
+    -o "$BUILD_DIR/$EXECUTABLE-$ARCH"
+  SLICES+=("$BUILD_DIR/$EXECUTABLE-$ARCH")
+done
+lipo -create "${SLICES[@]}" -output "$MACOS_DIR/$EXECUTABLE"
+rm -f "${SLICES[@]}"
 
 if [ -f tools/MakeIcon.swift ]; then
   echo "==> Rendering app icon"
