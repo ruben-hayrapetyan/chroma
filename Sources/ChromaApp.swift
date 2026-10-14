@@ -91,9 +91,14 @@ struct ChromaApp: App {
                     Toggle("Show \(filter.label)", isOn: $store.showFilteredEvents)
                         .keyboardShortcut("o", modifiers: [.command, .shift])
                 }
-                // ⌥⌘1–9 for the first nine connected calendars, beside the
-                // ⌘1–4 that pick the view.
-                ForEach(Array(store.extraCalendars.enumerated()), id: \.element.id) { index, extra in
+                Toggle("Show Library Rooms",
+                       isOn: Binding(get: { store.showsLibraryRooms },
+                                     set: { _ in store.toggleLibraryRooms() }))
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                // ⌥⌘1–9 for the first nine other connected calendars, beside
+                // the ⌘1–4 that pick the view. Library Rooms has its own above.
+                ForEach(Array(store.extraCalendars.filter { !Personal.isLibrary($0.ref.title) }
+                    .enumerated()), id: \.element.id) { index, extra in
                     Toggle("Show \(extra.ref.title)",
                            isOn: Binding(get: { extra.isShown },
                                          set: { store.setShown(extra.id, $0) }))

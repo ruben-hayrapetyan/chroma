@@ -258,7 +258,7 @@ struct ContentView: View {
 
                 todayButton(labelled: showsTodayLabel)
 
-                filterButton
+                PersonalToggles()
                 calendarsMenu
                 pinnedCalendarButtons
 
@@ -326,7 +326,9 @@ struct ContentView: View {
     /// Connected calendars given a button of their own in Settings: one click
     /// to show or hide, where the stack menu takes two.
     private var pinnedCalendarButtons: some View {
-        ForEach(Array(store.extraCalendars.enumerated()), id: \.element.id) { index, extra in
+        // Numbered as the View menu numbers them, without Library Rooms.
+        ForEach(Array(store.extraCalendars.filter { !Personal.isLibrary($0.ref.title) }
+            .enumerated()), id: \.element.id) { index, extra in
             if extra.inToolbar {
                 CalendarToggleButton(
                     title: extra.ref.title,
