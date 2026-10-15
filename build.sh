@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 APP_NAME="Chroma"
 EXECUTABLE="Chroma"
 BUNDLE_ID="com.chroma.app"
-VERSION="1.0"
+VERSION="1.0.1"
 
 BUILD_DIR="build"
 APP="$BUILD_DIR/$APP_NAME.app"

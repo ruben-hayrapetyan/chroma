@@ -9,7 +9,8 @@ import Foundation
 /// below is what that file starts out as.
 struct EventCategory: Codable {
     let name: String
-    /// The token Claude writes into an event's notes to name this category.
+    /// The short name Claude picks categories by, and what a `[chroma: …]`
+    /// marker in an event's notes refers to.
     let slug: String
     let pigmentID: String
     let pattern: String
@@ -272,11 +273,10 @@ enum Categories {
 
     /// An explicit marker beats the title rules.
     ///
-    /// Claude writes `[chroma: club]` into an event's notes when it creates one,
-    /// because it can only reach the calendar through AppleScript and has no way
-    /// to touch the app's colour store directly. A marker in the event itself is
-    /// the one channel that survives that boundary — and it syncs, so the
-    /// category travels with the event.
+    /// `[chroma: club]` in an event's notes names its category outright. It's
+    /// how something with no access to the colour store — another app, a
+    /// script, a person on another device — can say what an event is, and
+    /// since it lives in the event, it syncs with it.
     ///
     /// A calendar given its own colour in Settings beats both: its titles are
     /// whatever its owner typed, and the calendar says more about the event than
@@ -339,6 +339,9 @@ enum Categories {
         for item in items {
             guard !seen.contains(item.seriesID) else { continue }
             seen.insert(item.seriesID)
+            // Checked before the rules run: this pass repeats on every reload,
+            // and nearly everything it sees already has a colour.
+            if !overwritingManual, colors.hasChoice(for: item.seriesID) { continue }
 
             guard let category = category(for: item) else {
                 result.unmatched.append(item.title)
@@ -346,7 +349,6 @@ enum Categories {
             }
             perCategory[category.name, default: []].insert(item.seriesID)
 
-            if !overwritingManual, colors.assigned(for: item.seriesID) != nil { continue }
             colors.set(EventColor.named(category.pigmentID), for: item.seriesID)
             result.assigned += 1
         }

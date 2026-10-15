@@ -21,6 +21,10 @@ struct DetailPane: View {
     @State private var location = ""
     @State private var notes = ""
     @State private var recurrence = RecurrenceDraft()
+    /// The repeat as the editor first read it. Saving passes the rule through
+    /// untouched unless the editor moved away from this, so changing a title
+    /// can't flatten a pattern the editor has no controls for.
+    @State private var seededRecurrence = RecurrenceDraft()
     @State private var error: String?
     @State private var confirmingDelete = false
     @FocusState private var titleFocused: Bool
@@ -178,6 +182,14 @@ struct DetailPane: View {
 
             RecurrenceEditor(draft: $recurrence)
 
+            if !RecurrenceDraft.canShow(item.ekEvent.recurrenceRules) {
+                Label("This repeats in a pattern the editor can't show. It's kept as long as Repeat is left alone.",
+                      systemImage: "info.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if item.isRecurring {
                 Label("Changes apply to this and all later occurrences.",
                       systemImage: "repeat")
@@ -211,9 +223,9 @@ struct DetailPane: View {
         VStack(alignment: .leading, spacing: 7) {
             label("Colour", systemImage: "paintpalette")
             HStack(spacing: 7) {
-                swatch(nil, color: EventColors.fallback.color)
+                swatch(EventColors.fallback)
                 ForEach(EventColor.palette) { option in
-                    swatch(option, color: option.color)
+                    swatch(option)
                 }
             }
             if item.isRecurring {
@@ -224,10 +236,10 @@ struct DetailPane: View {
         }
     }
 
-    private func swatch(_ option: EventColor?, color: Color) -> some View {
-        let isOn = colors.assigned(for: item.seriesID)?.id == option?.id
+    private func swatch(_ option: EventColor) -> some View {
+        let isOn = (colors.assignments[item.seriesID] ?? EventColors.fallback.id) == option.id
         return RoundedRectangle(cornerRadius: 3, style: .continuous)
-            .fill(color)
+            .fill(option.color)
             .frame(width: 21, height: 21)
             .overlay(
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -236,7 +248,7 @@ struct DetailPane: View {
             )
             .contentShape(Rectangle())
             .onTapGesture { colors.set(option, for: item.seriesID) }
-            .help(option?.name ?? EventColors.fallback.name)
+            .help(option.name)
     }
 
     private var actions: some View {
@@ -278,15 +290,17 @@ struct DetailPane: View {
         location = item.location
         notes = item.notes
         recurrence = RecurrenceDraft.from(item.ekEvent.recurrenceRules?.first)
+        seededRecurrence = recurrence
     }
 
     private func save() {
         let cleaned = title.trimmingCharacters(in: .whitespaces)
         guard !cleaned.isEmpty else { return }
         do {
-            try store.update(item, title: cleaned, start: start, end: end,
-                             isAllDay: isAllDay, location: location, notes: notes,
-                             recurrence: recurrence.edit)
+            let savedID = try store.update(item, title: cleaned, start: start, end: end,
+                                           isAllDay: isAllDay, location: location, notes: notes,
+                                           recurrence: recurrence == seededRecurrence ? .unchanged : recurrence.edit)
+            colors.carry(from: item.seriesID, to: savedID)
             isEditing = false
         } catch {
             self.error = error.localizedDescription
@@ -296,7 +310,7 @@ struct DetailPane: View {
     private func performDelete() {
         do {
             try store.delete(item)
-            colors.set(nil, for: item.seriesID)
+            if !store.seriesExists(item.seriesID) { colors.set(nil, for: item.seriesID) }
             onClose()
         } catch {
             self.error = error.localizedDescription

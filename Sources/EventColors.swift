@@ -85,23 +85,48 @@ final class EventColors: ObservableObject {
             self.fileURL = folder.appendingPathComponent("colors.json")
         }
         load()
+        // A change made just before ⌘Q still gets written.
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.savePending else { return }
+                self.save()
+            }
+        }
     }
+
+    private var quitObserver: NSObjectProtocol?
 
     func color(for seriesID: String) -> Color {
         EventColor.named(assignments[seriesID])?.color ?? Self.fallback.color
     }
 
-    func assigned(for seriesID: String) -> EventColor? {
-        EventColor.named(assignments[seriesID])
+    /// Whether the series has a colour of its own — a pigment, or "Unmarked"
+    /// picked on purpose. Either way the category rules leave it be.
+    func hasChoice(for seriesID: String) -> Bool {
+        assignments[seriesID] != nil
     }
 
+    /// Nil hands the series back to the category rules. `fallback` keeps it
+    /// unmarked: it is stored like any other choice, under its own id, so the
+    /// rules don't paint over it on the next reload.
     func set(_ color: EventColor?, for seriesID: String) {
+        guard assignments[seriesID] != color?.id else { return }
         if let color {
             assignments[seriesID] = color.id
         } else {
             assignments.removeValue(forKey: seriesID)
         }
-        save()
+        scheduleSave()
+    }
+
+    /// Carries a colour across when a series comes back under a new
+    /// identifier, as the later half of a split series does.
+    func carry(from oldID: String, to newID: String?) {
+        guard let newID, newID != oldID, let id = assignments[oldID] else { return }
+        assignments[newID] = id
+        scheduleSave()
     }
 
     private func load() {
@@ -109,6 +134,20 @@ final class EventColors: ObservableObject {
               let decoded = try? JSONDecoder().decode([String: String].self, from: data)
         else { return }
         assignments = decoded
+    }
+
+    /// One write per burst of changes. The first pass over a calendar colours
+    /// hundreds of series in a row, and there's no use rewriting the whole
+    /// file for each one.
+    private var savePending = false
+
+    private func scheduleSave() {
+        guard !savePending else { return }
+        savePending = true
+        Task { @MainActor in
+            self.savePending = false
+            self.save()
+        }
     }
 
     private func save() {

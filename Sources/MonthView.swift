@@ -183,6 +183,10 @@ struct ColorMenu: View {
             Button(swatch.name) { colors.set(swatch, for: item.seriesID) }
         }
         Divider()
-        Button("Use Calendar Colour") { colors.set(nil, for: item.seriesID) }
+        Button(EventColors.fallback.name) { colors.set(EventColors.fallback, for: item.seriesID) }
+        Button("Colour by Category") {
+            colors.set(nil, for: item.seriesID)
+            Categories.apply([item], colors: colors)
+        }
     }
 }
