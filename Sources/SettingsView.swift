@@ -135,13 +135,17 @@ struct CalendarSettings: View {
             Spacer()
 
             if let extra {
-                Toggle("Toolbar button", isOn: Binding(
-                    get: { extra.inToolbar },
-                    set: { store.setInToolbar(extra.id, $0) }
-                ))
-                .toggleStyle(.checkbox)
-                .fixedSize()
-                .help("Give \(calendar.title) its own show/hide button in the toolbar")
+                // Library Rooms always has its own button, so the switch
+                // would do nothing for it.
+                if !Personal.isLibrary(calendar.title) {
+                    Toggle("Toolbar button", isOn: Binding(
+                        get: { extra.inToolbar },
+                        set: { store.setInToolbar(extra.id, $0) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
+                    .help("Give \(calendar.title) its own show/hide button in the toolbar")
+                }
 
                 Picker("Colour", selection: Binding(
                     get: { extra.colorID ?? "" },

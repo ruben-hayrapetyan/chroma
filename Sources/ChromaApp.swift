@@ -95,6 +95,9 @@ struct ChromaApp: App {
                        isOn: Binding(get: { store.showsLibraryRooms },
                                      set: { _ in store.toggleLibraryRooms() }))
                     .keyboardShortcut("l", modifiers: [.command, .shift])
+                    // Greyed out until the calendar reaches this Mac, rather
+                    // than a shortcut that silently does nothing.
+                    .disabled(store.libraryRooms == nil && store.libraryCalendar == nil)
                 // ⌥⌘1–9 for the first nine other connected calendars, beside
                 // the ⌘1–4 that pick the view. Library Rooms has its own above.
                 ForEach(Array(store.extraCalendars.filter { !Personal.isLibrary($0.ref.title) }
