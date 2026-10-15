@@ -25,7 +25,8 @@ dependencies.
   Add iCloud, Google, Exchange or CalDAV accounts in **System Settings ›
   Internet Accounts**. If a calendar appears in Calendar.app, Chroma can show it.
 - **Optional: [Claude Code](https://claude.com/claude-code)**, for Ask Claude.
-  Everything else works without it.
+  Everything else works without it. If Ask Claude says your copy is too old,
+  run `claude update`.
 - **To build from source:** the Xcode Command Line Tools
   (`xcode-select --install`). Xcode itself isn't needed.
 
@@ -172,16 +173,19 @@ the last good rules in place, and Settings says what's wrong and where.
 
 Categorising happens on its own: the first reload after launch covers the whole
 calendar, and every reload after that catches whatever just arrived — from
-Claude, from Calendar.app, from another device. Events coloured by hand in the
-inspector are never overwritten. **Organize › Assign Categories to Everything**
+Claude, from Calendar.app, from another device. Events given a colour by hand,
+**Unmarked** included, are never overwritten. **Organize › Assign Categories to Everything**
 (`⇧⌘K`) re-runs the rules over the entire calendar and *does* overwrite hand
 choices, which is the point of asking for it.
 
 Claude assigns a category to anything it creates, from the slugs in
-`categories.json`. It cannot reach the app's
-colour store through AppleScript, so it writes a marker — `[chroma: club]` — on
-the last line of the event's notes, and the app reads it. An explicit marker
-beats the title rules, so it also travels with the event to your other devices.
+`categories.json`, and Chroma colours the event to match. Like every colour,
+that one stays on this Mac.
+
+A marker on the last line of an event's notes, such as `[chroma: club]`, names
+its category outright and beats the title rules. It's for anything that can
+write to your calendar but not to Chroma: another app, a script, or you on your
+phone. Because the marker is part of the event, it syncs with it.
 
 **Search.** `⌘F`, or the field at the top of the sidebar. Matches are ranked by
 how well they hit the title — exact, then prefix, then word-start, then
@@ -206,10 +210,15 @@ event's identifier. Two consequences, neither avoidable:
   occurrence shares an identifier.
 
 Set one in the event editor, or right-click any event anywhere in the app.
+**Unmarked** is a choice like any other, and the category rules leave it alone.
+To hand an event back to the rules, right-click it and choose **Colour by
+Category**.
 
 **Repeats are editable.** Both the create pane and the inspector carry a repeat
 control — frequency, interval, weekdays for weekly, and an end that is either a
 date or a number of occurrences. Clearing it back to Never removes the repeat.
+A pattern the control can't express, like "the second Tuesday of every month",
+is kept as long as you leave Repeat alone; the editor says when that applies.
 
 **Recurring events are expanded.** Every occurrence lands on its own date, which
 is what the `.ics` export could not manage.
@@ -242,7 +251,7 @@ switcher when more than one input source is installed.
 ## Ask Claude
 
 `⌃Space`, or the sidebar button, opens a panel inside the app. Type a request in
-plain language, press `⌘↩`, and the response streams back in place.
+plain language, press `⌘↩`, and the reply appears in place.
 
 It runs your own [Claude Code](https://claude.com/claude-code) install, signed in
 to your own account. Chroma never sees or stores a Claude login, and requests
@@ -261,9 +270,12 @@ anything anywhere. Each request includes the snapshot below — the title, time,
 location and category of every event on the calendars being shown, five months
 back to seven ahead — and goes to Anthropic through the CLI, under your
 account's terms. Event notes are not included. Nothing is sent until you press
-Send.
+Send, and Chroma turns off the CLI's saved sessions, so no copy of the request
+is kept in `~/.claude`.
 
-**Claude has no tools.** It never touches the calendar itself. The prompt carries
+**Claude has no tools.** It never touches the calendar itself. Chroma starts the
+CLI with every tool switched off and none of your MCP servers loaded, so that's
+enforced, not just asked for. The prompt carries
 a numbered snapshot of your events — the year around the day in view, five months
 back and seven ahead — and Claude replies with a sentence for you plus a JSON
 plan:
@@ -275,8 +287,11 @@ plan:
   "recurrence":{"freq":"weekly","interval":1,"byDay":["TU"],"until":"2026-12-19"}}]}
 ```
 
-Chroma applies that through EventKit and lists what changed. `update` and
-`delete` refer to events by their number in the snapshot. Events from other
+Chroma applies that through EventKit and lists what changed. If the reply has
+no plan, or one Chroma can't read, nothing is applied and the panel says so:
+Claude's sentence alone doesn't mean anything changed. A request you stop, or
+one still running after three minutes, is stopped without applying anything.
+`update` and `delete` refer to events by their number in the snapshot. Events from other
 calendars are marked read-only in it; a plan that tries to change one is
 refused, so a shared calendar can't lose someone else's booking to a wrong guess.
 
@@ -287,12 +302,16 @@ a plan instead removes all three problems, and the tool allowlist along with the
 
 Repeating events can be changed one occurrence at a time — `"occurrences":
 ["2026-09-02","2026-09-09"]` on an update or delete affects only those dates.
-Leave it off and the change applies to the whole series.
+Leave it off and the change applies from the occurrence in the snapshot
+onwards.
 
-Repeating events appear once in the snapshot rather than as every occurrence.
-Expanded, a term of one thrice-weekly lecture is forty-five lines on its own;
-collapsed, the whole year fits in about a hundred and fifty. Nothing is lost,
-since editing a repeating event applies to the series either way.
+Repeating events appear once in the snapshot, as their next occurrence from the
+day in view, rather than as every occurrence. Expanded, a term of one
+thrice-weekly lecture is forty-five lines on its own; collapsed, the whole year
+fits in about a hundred and fifty. Changing a series changes it from that
+occurrence on, so its past stays as it was. A calendar that still runs past 400
+lines keeps the 400 events nearest the day in view, and the prompt tells Claude
+where the list stops.
 
 ## Layout
 

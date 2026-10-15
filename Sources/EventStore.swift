@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import EventKit
 import Foundation
@@ -102,10 +103,25 @@ struct EventItem: Identifiable {
         self.ekEvent = event
     }
 
-    /// Minutes from midnight, used to place the block in the day and week grids.
-    func minutesFromMidnight(in calendar: Calendar) -> Double {
-        let startOfDay = calendar.startOfDay(for: start)
-        return start.timeIntervalSince(startOfDay) / 60
+    /// Where the block sits in one day's column, in minutes from midnight:
+    /// clipped to that day, so an event running past midnight shows on both,
+    /// and read off the clock rather than the seconds elapsed, so on the day
+    /// the clocks change a 3 PM event still lines up with 3 PM.
+    func clockSpan(on day: Date, in calendar: Calendar) -> (start: Double, end: Double) {
+        Self.clockSpan(from: start, to: end, on: day, in: calendar)
+    }
+
+    static func clockSpan(from start: Date, to end: Date, on day: Date,
+                          in calendar: Calendar) -> (start: Double, end: Double) {
+        let dayStart = calendar.startOfDay(for: day)
+        let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        func clock(_ date: Date) -> Double {
+            let parts = calendar.dateComponents([.hour, .minute, .second], from: date)
+            return Double((parts.hour ?? 0) * 60 + (parts.minute ?? 0)) + Double(parts.second ?? 0) / 60
+        }
+        let from = start <= dayStart ? 0 : clock(start)
+        let to = end >= dayEnd ? 24 * 60 : clock(end)
+        return (from, max(to, from))
     }
 
     var durationMinutes: Double {
@@ -180,19 +196,34 @@ final class EventStore: ObservableObject {
         didSet { if oldValue != mode { reload() } }
     }
 
-    let calendar = Calendar.current
+    /// Follows the system's time zone as it changes, rather than keeping the
+    /// one the app launched in.
+    let calendar = Calendar.autoupdatingCurrent
     private let store = EKEventStore()
-    private var observer: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
     private var rulesSubscription: AnyCancellable?
 
+    /// The day that was today at the last check. The app stays open for days
+    /// at a time, so "today" has to move on by itself.
+    private var today = Calendar.current.startOfDay(for: Date())
+
     init() {
-        observer = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
             forName: .EKEventStoreChanged, object: store, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.corpusIsStale = true
                 self?.reload()
             }
+        })
+        // Midnight, a clock or time-zone change, and waking from a night's
+        // sleep — the last of which doesn't always arrive as a day change.
+        for name in [Notification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange,
+                     NSApplication.didBecomeActiveNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.rollOverIfNeeded() }
+            })
         }
         // A new filter changes what is drawn, and new rules change what gets
         // coloured. Deferred a turn because @Published fires before the value
@@ -205,7 +236,7 @@ final class EventStore: ObservableObject {
     }
 
     deinit {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observers.forEach(NotificationCenter.default.removeObserver)
     }
 
     nonisolated private static func loadDefault<T: Decodable>(_ key: String) -> T? {
@@ -393,27 +424,23 @@ final class EventStore: ObservableObject {
                 return lhs.start < rhs.start
             }
         itemsByDay = Self.index(items, calendar: self.calendar)
-        corpusIsStale = true
         revision += 1
     }
 
-    /// Bucket each event under every day it shows on. All-day events span
-    /// [start, end) and so land on several days; timed ones land on one.
+    /// Bucket each event under every day it shows on: each day that starts
+    /// before the event ends. That keeps the last day of a multi-day all-day
+    /// event whether its end comes as 23:59:59 on that day or as the midnight
+    /// after it, and puts a timed event running past midnight on both days —
+    /// while one ending exactly at midnight stays on its own.
     private static func index(_ items: [EventItem], calendar: Calendar) -> [Date: [EventItem]] {
         var index: [Date: [EventItem]] = [:]
         for item in items {
-            let first = calendar.startOfDay(for: item.start)
-            guard item.isAllDay else {
-                index[first, default: []].append(item)
-                continue
-            }
-            let last = calendar.startOfDay(for: item.end)
-            var day = first
+            var day = calendar.startOfDay(for: item.start)
             repeat {
                 index[day, default: []].append(item)
                 guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
                 day = next
-            } while day < last
+            } while day < item.end
         }
         return index
     }
@@ -449,16 +476,22 @@ final class EventStore: ObservableObject {
         // A repeating event has to be saved across the series, not just the
         // first occurrence, or EventKit drops the rule.
         try store.save(event, span: recurrence == nil ? .thisEvent : .futureEvents, commit: true)
+        corpusIsStale = true
         reload()
         return event.eventIdentifier
     }
 
     /// Repeating events are changed for this and all later occurrences —
     /// occurrence-level editing is a bigger feature than this app claims.
+    ///
+    /// Returns the event's identifier after the save. Changing a series from
+    /// partway through splits it in two, and the later half comes back under a
+    /// new identifier — which is what its colour has to follow.
+    @discardableResult
     func update(_ item: EventItem, title: String, start: Date, end: Date,
                 isAllDay: Bool, location: String, notes: String,
                 recurrence: RecurrenceEdit = .unchanged,
-                span: EKSpan? = nil) throws {
+                span: EKSpan? = nil) throws -> String? {
         let event = item.ekEvent
         event.title = title
         event.startDate = start
@@ -479,13 +512,22 @@ final class EventStore: ObservableObject {
         }
         let repeating = nowRepeats
         try store.save(event, span: span ?? (repeating ? .futureEvents : .thisEvent), commit: true)
+        corpusIsStale = true
         reload()
+        return event.eventIdentifier
     }
 
     func delete(_ item: EventItem, span: EKSpan? = nil) throws {
         let scope = span ?? (item.isRecurring ? .futureEvents : .thisEvent)
         try store.remove(item.ekEvent, span: scope, commit: true)
+        corpusIsStale = true
         reload()
+    }
+
+    /// Whether any of a series is left. Deleting "this and later" from partway
+    /// through keeps the earlier occurrences, and with them their colour.
+    func seriesExists(_ seriesID: String) -> Bool {
+        store.event(withIdentifier: seriesID) != nil
     }
 
     /// One occurrence of a repeating event, by the day it falls on.
@@ -510,7 +552,9 @@ final class EventStore: ObservableObject {
 
     /// Search has to reach past the visible span, so it keeps its own corpus:
     /// four years centred on today, fetched once and reused until something in
-    /// the calendar changes.
+    /// the calendar changes. Moving the view doesn't count: the corpus doesn't
+    /// depend on where you're looking, so stepping to the next week has no
+    /// reason to fetch four years of events again.
     private var corpus: [EventItem] = []
     private var corpusIsStale = true
 
@@ -624,6 +668,20 @@ final class EventStore: ObservableObject {
     func goToToday() {
         anchor = Date()
         selectedDay = calendar.startOfDay(for: Date())
+        reload()
+    }
+
+    /// Moves the view on when the day changes under it. Whoever was looking at
+    /// today goes on looking at today; whoever had gone to another day stays
+    /// there. Either way the grids redraw, so the today marker moves too.
+    private func rollOverIfNeeded() {
+        let now = calendar.startOfDay(for: Date())
+        guard now != today else { return }
+        let dayAfter = calendar.date(byAdding: .day, value: 1, to: today) ?? today
+        if selectedDay == today { selectedDay = now }
+        if anchor >= today && anchor < dayAfter { anchor = Date() }
+        today = now
+        corpusIsStale = true
         reload()
     }
 

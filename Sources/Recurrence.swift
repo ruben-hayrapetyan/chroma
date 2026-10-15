@@ -109,6 +109,23 @@ struct RecurrenceDraft: Equatable {
         return draft
     }
 
+    /// Whether the editor can show these rules as they are. It knows one rule
+    /// of every n days, weeks, months or years, on plain weekdays for weekly.
+    /// "The 2nd Tuesday of every month" or a second rule beside the first is
+    /// more than that, and only survives an edit that leaves Repeat alone.
+    static func canShow(_ rules: [EKRecurrenceRule]?) -> Bool {
+        guard let rules, !rules.isEmpty else { return true }
+        guard rules.count == 1, let rule = rules.first else { return false }
+        let days = rule.daysOfTheWeek ?? []
+        return (rule.frequency == .weekly || days.isEmpty)
+            && days.allSatisfy { $0.weekNumber == 0 }
+            && (rule.daysOfTheMonth ?? []).isEmpty
+            && (rule.monthsOfTheYear ?? []).isEmpty
+            && (rule.weeksOfTheYear ?? []).isEmpty
+            && (rule.daysOfTheYear ?? []).isEmpty
+            && (rule.setPositions ?? []).isEmpty
+    }
+
     /// "Weekly on Mon, Wed until 19 Dec" — shown when the editor is collapsed.
     var summary: String {
         guard repeats else { return "Never" }

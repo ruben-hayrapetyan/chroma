@@ -190,8 +190,12 @@ struct DayColumn: View {
     private func beginDraft(atY y: CGFloat) {
         let rawMinutes = Double(y) / Double(Theme.hourHeight) * 60
         // Snap to the quarter hour, and keep the whole block inside the day.
-        let snapped = min(max((rawMinutes / 15).rounded(.down) * 15, 0), 24 * 60 - 60)
-        let start = store.calendar.startOfDay(for: day).addingTimeInterval(snapped * 60)
+        let snapped = Int(min(max((rawMinutes / 15).rounded(.down) * 15, 0), 24 * 60 - 60))
+        // By the clock, so the row clicked is the time you get even on the
+        // day the clocks change.
+        let start = store.calendar.date(bySettingHour: snapped / 60, minute: snapped % 60,
+                                        second: 0, of: day)
+            ?? store.calendar.startOfDay(for: day).addingTimeInterval(Double(snapped) * 60)
         withAnimation(.snappy(duration: 0.18)) {
             intents.draft = .hour(at: start)
         }
@@ -200,9 +204,9 @@ struct DayColumn: View {
     /// The provisional block: dashed, accent-tinted, and labelled with the span
     /// it will occupy, so the time is visible before anything is typed.
     private func draftBlock(_ draft: DraftEvent, width: CGFloat) -> some View {
-        let startOfDay = store.calendar.startOfDay(for: draft.start)
-        let minutes = draft.start.timeIntervalSince(startOfDay) / 60
-        let height = max(draft.end.timeIntervalSince(draft.start) / 3600 * Theme.hourHeight, 20)
+        let span = EventItem.clockSpan(from: draft.start, to: draft.end, on: day, in: store.calendar)
+        let minutes = span.start
+        let height = max((span.end - span.start) / 60 * Theme.hourHeight, 20)
 
         return VStack(alignment: .leading, spacing: 1) {
             Text(draft.title.isEmpty ? "New Event" : draft.title)
@@ -250,8 +254,9 @@ struct DayColumn: View {
     }
 
     private func block(_ placed: PositionedEvent, width: CGFloat) -> some View {
-        let minutes = placed.item.minutesFromMidnight(in: store.calendar)
-        let height = max(CGFloat(placed.item.durationMinutes) / 60 * Theme.hourHeight, 16)
+        let span = placed.item.clockSpan(on: day, in: store.calendar)
+        let minutes = span.start
+        let height = max(CGFloat(max(span.end - span.start, 15)) / 60 * Theme.hourHeight, 16)
         let inset: CGFloat = 3
         let usable = width - inset * 2
         let columnWidth = usable / CGFloat(placed.columnCount)
@@ -268,9 +273,8 @@ struct DayColumn: View {
     /// The red "now" line, redrawn every minute.
     private var nowLine: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
-            let calendar = store.calendar
-            let startOfDay = calendar.startOfDay(for: context.date)
-            let minutes = context.date.timeIntervalSince(startOfDay) / 60
+            let minutes = EventItem.clockSpan(from: context.date, to: context.date,
+                                              on: context.date, in: store.calendar).start
 
             ZStack(alignment: .leading) {
                 Circle()
