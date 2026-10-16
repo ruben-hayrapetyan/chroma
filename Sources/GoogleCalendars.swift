@@ -8,11 +8,14 @@ struct GoogleEvent: Decodable {
     struct Time: Decodable {
         var date: String?
         var dateTime: String?
+        /// The zone a timed event was set in, which its repeats follow.
+        var timeZone: String?
     }
 
     struct Organizer: Decodable {
+        var email: String?
         var isSelf: Bool?
-        private enum CodingKeys: String, CodingKey { case isSelf = "self" }
+        private enum CodingKeys: String, CodingKey { case email, isSelf = "self" }
     }
 
     var id: String
@@ -31,7 +34,7 @@ struct GoogleEvent: Decodable {
     var eventType: String?
 
     static let fields = "id,status,summary,description,location,start,end,recurringEventId,"
-        + "originalStartTime,recurrence,locked,guestsCanModify,organizer(self),eventType"
+        + "originalStartTime,recurrence,locked,guestsCanModify,organizer(email,self),eventType"
 }
 
 /// What it takes to change a Google event later.
@@ -40,8 +43,13 @@ struct GoogleEventRef {
     /// The occurrence's own id for an event in a series, which is how Google
     /// changes one date on its own; the event's id otherwise.
     let eventID: String
+    /// The series' own id, as Google knows it. `EventItem.seriesID` adds the
+    /// calendar, since an invitation keeps one id on every calendar it's on.
+    let seriesEventID: String
     /// Where this occurrence sits in its series, before any edit moved it.
     let originalStart: Date?
+    /// The zone the event was set in, kept when it's edited from elsewhere.
+    let timeZone: String?
     let rules: [EKRecurrenceRule]?
 }
 
@@ -103,8 +111,19 @@ final class GoogleAPI {
             .map { try JSONDecoder().decode(GoogleEvent.self, from: $0) }
     }
 
+    /// The whole event, every field Google has — what a series split copies,
+    /// so guests, the Meet link and reminders carry over to the new half.
+    func fullEvent(_ calendar: String, _ id: String) async throws -> [String: Any]? {
+        try await send("GET", "/calendars/\(segment(calendar))/events/\(segment(id))")
+            .flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    }
+
     func insert(_ calendar: String, _ body: [String: Any]) async throws -> GoogleEvent {
-        try await write("POST", "/calendars/\(segment(calendar))/events", body)
+        // Without these, Google drops a copied Meet link and attachments.
+        try await write("POST", "/calendars/\(segment(calendar))/events", body, extra: [
+            URLQueryItem(name: "conferenceDataVersion", value: "1"),
+            URLQueryItem(name: "supportsAttachments", value: "true"),
+        ])
     }
 
     func patch(_ calendar: String, _ id: String, _ body: [String: Any]) async throws -> GoogleEvent {
@@ -125,7 +144,9 @@ final class GoogleAPI {
             URLQueryItem(name: "maxResults", value: "1"),
             URLQueryItem(name: "fields", value: "items(id)"),
         ])
-        guard let data else { return false }
+        // A 410 means the last look is too long ago for Google to answer
+        // from — which only a full fetch can settle.
+        guard let data else { return true }
         return !(try JSONDecoder().decode(Page<GoogleEvent>.self, from: data).items ?? []).isEmpty
     }
 
@@ -149,8 +170,9 @@ final class GoogleAPI {
         return all
     }
 
-    private func write(_ method: String, _ path: String, _ body: [String: Any]) async throws -> GoogleEvent {
-        let query = [URLQueryItem(name: "fields", value: GoogleEvent.fields)]
+    private func write(_ method: String, _ path: String, _ body: [String: Any],
+                       extra: [URLQueryItem] = []) async throws -> GoogleEvent {
+        let query = [URLQueryItem(name: "fields", value: GoogleEvent.fields)] + extra
         guard let data = try await send(method, path, query: query, body: body) else {
             throw GoogleError.server(404, "Google couldn't find that event any more.")
         }
@@ -221,7 +243,7 @@ final class GoogleCalendars: CalendarProvider {
     private var entries: [CalendarInfo] = []
     private let calendar = Calendar.autoupdatingCurrent
 
-    private struct Stored {
+    struct Stored {
         let event: GoogleEvent
         let start: Date
         let end: Date
@@ -239,15 +261,32 @@ final class GoogleCalendars: CalendarProvider {
 
     private var caches: [String: Cache] = [:]
     private var fetching: Set<String> = []
+    /// The window each calendar was last asked for. The background check
+    /// fetches whatever this still covers more of than the cache — a first
+    /// fetch that failed, or a window that couldn't be extended.
+    private var wanted: [String: DateInterval] = [:]
     /// When Chroma last changed something on each calendar. A fetch that
     /// started before then is out of date by the time it lands, so it runs
     /// again.
     private var editedAt: [String: Date] = [:]
     /// A calendar whose fetch just failed isn't asked again on every redraw.
     private var retryAfter: [String: Date] = [:]
+    /// What's failing, by calendar id, and "" for the calendar list. The
+    /// offline note stays while anything is.
+    private var failures: [String: String] = [:]
+    /// Bumped on every sign-in and sign-out, so a fetch made for one account
+    /// can't land after it's gone.
+    private var generation = 0
     private var timer: Timer?
     private var activation: NSObjectProtocol?
     private var lastCheck = Date.distantPast
+
+    /// The series key `EventItem` carries: the calendar and Google's id. An
+    /// invitation keeps one id on every calendar it's on, and each copy needs
+    /// its own row and its own colour.
+    static func key(_ calendarID: String, _ eventID: String) -> String {
+        calendarID + "/" + eventID
+    }
 
     // MARK: - Access
 
@@ -266,16 +305,28 @@ final class GoogleCalendars: CalendarProvider {
 
     func signIn() async throws {
         try await auth.signIn()
+        forget()
         try await loadCalendars()
         startWatching()
     }
 
     func signOut() async {
         stopWatching()
-        caches = [:]
+        forget()
         entries = []
         account = nil
         await auth.signOut()
+    }
+
+    /// Drops everything fetched, for a change of account.
+    private func forget() {
+        generation += 1
+        caches = [:]
+        wanted = [:]
+        editedAt = [:]
+        retryAfter = [:]
+        failures = [:]
+        onProblem?(nil)
     }
 
     // MARK: - Calendars
@@ -287,7 +338,9 @@ final class GoogleCalendars: CalendarProvider {
     /// Returns whether the list changed.
     @discardableResult
     private func loadCalendars() async throws -> Bool {
+        let generation = self.generation
         let list = try await api.calendarList()
+        guard generation == self.generation else { return false }
         // The primary calendar's id is the account's address.
         account = list.first { $0.primary == true }?.id ?? account
         let fresh = list.map { entry in
@@ -339,12 +392,14 @@ final class GoogleCalendars: CalendarProvider {
         return DateInterval(start: from, end: to)
     }
 
+    private static func union(_ a: DateInterval, _ b: DateInterval) -> DateInterval {
+        DateInterval(start: min(a.start, b.start), end: max(a.end, b.end))
+    }
+
     private func fetch(_ id: String, covering range: DateInterval) {
+        let window = Self.union(Self.union(caches[id]?.window ?? standardWindow(), standardWindow()), range)
+        wanted[id] = window
         guard !fetching.contains(id), (retryAfter[id] ?? .distantPast) < Date() else { return }
-        var window = caches[id]?.window ?? standardWindow()
-        for extra in [standardWindow(), range] {
-            window = DateInterval(start: min(window.start, extra.start), end: max(window.end, extra.end))
-        }
         Task { await load(id, window: window) }
     }
 
@@ -354,6 +409,7 @@ final class GoogleCalendars: CalendarProvider {
         guard !fetching.contains(id) else { return }
         fetching.insert(id)
         defer { fetching.remove(id) }
+        let generation = self.generation
         var started: Date
         repeat {
             started = Date()
@@ -362,18 +418,24 @@ final class GoogleCalendars: CalendarProvider {
                 async let series = api.events(id, from: window.start, to: window.end, expanded: false,
                                               fields: "id,recurrence")
                 let (events, masters) = try await (occurrences, series)
+                guard generation == self.generation else { return }
                 var rules: [String: [EKRecurrenceRule]] = [:]
                 for master in masters {
                     if let parsed = RRule.rules(master.recurrence) { rules[master.id] = parsed }
                 }
                 caches[id] = Cache(window: window, events: events.compactMap(stored),
                                    rules: rules, fetchedAt: started)
+                if let asked = wanted[id], window.start <= asked.start, window.end >= asked.end {
+                    wanted[id] = nil
+                }
                 retryAfter[id] = nil
-                onProblem?(nil)
+                failures[id] = nil
+                report()
                 onChange?()
             } catch {
+                guard generation == self.generation else { return }
                 retryAfter[id] = Date().addingTimeInterval(30)
-                handle(error)
+                handle(error, for: id)
                 return
             }
         } while (editedAt[id] ?? .distantPast) > started
@@ -389,27 +451,41 @@ final class GoogleCalendars: CalendarProvider {
             await load(id, window: window)
             return
         }
+        let generation = self.generation
         let from = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: dates.min() ?? Date())) ?? Date()
         let to = calendar.date(byAdding: .day, value: 2, to: calendar.startOfDay(for: dates.max() ?? Date())) ?? Date()
         do {
             let fresh = try await api.events(id, from: from, to: to, expanded: true)
-            guard var cache = caches[id] else { return }
+            guard generation == self.generation, var cache = caches[id] else { return }
             cache.events.removeAll { $0.start < to && ($0.end > from || $0.start >= from) }
             cache.events += fresh.compactMap(stored)
             caches[id] = cache
             onChange?()
         } catch {
-            handle(error)
+            guard generation == self.generation else { return }
+            handle(error, for: id)
         }
     }
 
-    private func handle(_ error: Error) {
+    private func handle(_ error: Error, for key: String) {
         if case GoogleError.signedOut = error {
             stopWatching()
+            forget()
             onSignedOut?()
         } else {
-            onProblem?("Couldn't reach Google — \(error.localizedDescription)")
+            failures[key] = "Couldn't reach Google — \(error.localizedDescription)"
+            report()
         }
+    }
+
+    private func report() {
+        onProblem?(failures.sorted { $0.key < $1.key }.first?.value)
+    }
+
+    /// Marks a calendar as changed by Chroma — before a write, and again once
+    /// it lands, so a fetch that started in between runs again.
+    private func edited(_ id: String) {
+        editedAt[id] = Date()
     }
 
     // MARK: - Watching for changes
@@ -438,18 +514,35 @@ final class GoogleCalendars: CalendarProvider {
 
     private func checkForChanges() async {
         lastCheck = Date()
+        let generation = self.generation
         do {
             let listChanged = try await loadCalendars()
+            failures[""] = nil
             for (id, cache) in caches where !fetching.contains(id) {
-                // A minute's overlap, for a clock that's a little off Google's.
-                if try await api.hasChanges(id, since: cache.fetchedAt.addingTimeInterval(-60)) {
-                    await load(id, window: cache.window)
+                do {
+                    // A minute's overlap, for a clock that's a little off Google's.
+                    if try await api.hasChanges(id, since: cache.fetchedAt.addingTimeInterval(-60)) {
+                        await load(id, window: cache.window)
+                    } else {
+                        failures[id] = nil
+                    }
+                } catch GoogleError.signedOut {
+                    throw GoogleError.signedOut
+                } catch {
+                    guard generation == self.generation else { return }
+                    failures[id] = "Couldn't reach Google — \(error.localizedDescription)"
                 }
             }
+            // What was asked for and never arrived.
+            for (id, window) in wanted where !fetching.contains(id) {
+                await load(id, window: caches[id].map { Self.union($0.window, window) } ?? window)
+            }
+            guard generation == self.generation else { return }
             if listChanged { onChange?() }
-            onProblem?(nil)
+            report()
         } catch {
-            handle(error)
+            guard generation == self.generation else { return }
+            handle(error, for: "")
         }
     }
 
@@ -459,38 +552,42 @@ final class GoogleCalendars: CalendarProvider {
                 in calendar: CalendarInfo) async throws -> String? {
         var body = Self.body(fields, calendar: self.calendar, forInsert: true)
         if let recurrence { body["recurrence"] = [RRule.line(recurrence, allDay: fields.isAllDay)] }
-        editedAt[calendar.id] = Date()
+        edited(calendar.id)
         let created = try await api.insert(calendar.id, body)
+        edited(calendar.id)
         await refetch(calendar.id, around: [fields.start, fields.end], wholeWindow: recurrence != nil)
-        return created.id
+        return Self.key(calendar.id, created.id)
     }
 
     func update(_ item: EventItem, to fields: EventFields, recurrence: RecurrenceEdit,
                 span: EKSpan) async throws -> String? {
         guard case .google(let ref) = item.origin else { return nil }
-        editedAt[ref.calendarID] = Date()
         let touched = [item.start, item.end, fields.start, fields.end]
+        edited(ref.calendarID)
 
         guard item.isRecurring else {
-            var body = Self.body(fields, calendar: calendar)
+            var body = Self.body(fields, calendar: calendar, zone: ref.timeZone)
             var becomesSeries = false
             if case .set(let rule) = recurrence {
                 body["recurrence"] = [RRule.line(rule, allDay: fields.isAllDay)]
                 becomesSeries = true
             }
             let saved = try await api.patch(ref.calendarID, ref.eventID, body)
+            edited(ref.calendarID)
             await refetch(ref.calendarID, around: touched, wholeWindow: becomesSeries)
-            return saved.id
+            return Self.key(ref.calendarID, saved.id)
         }
 
         if span == .thisEvent {
             // One date on its own: Google keeps it as an exception in the series.
-            _ = try await api.patch(ref.calendarID, ref.eventID, Self.body(fields, calendar: calendar))
+            _ = try await api.patch(ref.calendarID, ref.eventID, Self.body(fields, calendar: calendar, zone: ref.timeZone))
+            edited(ref.calendarID)
             await refetch(ref.calendarID, around: touched, wholeWindow: false)
             return item.seriesID
         }
 
         let savedID = try await changeFromHere(item, ref: ref, to: fields, recurrence: recurrence)
+        edited(ref.calendarID)
         await refetch(ref.calendarID, around: touched, wholeWindow: true)
         return savedID
     }
@@ -503,13 +600,20 @@ final class GoogleCalendars: CalendarProvider {
     /// duplicate to delete rather than weeks missing.
     private func changeFromHere(_ item: EventItem, ref: GoogleEventRef, to fields: EventFields,
                                 recurrence: RecurrenceEdit) async throws -> String? {
-        guard let master = try await api.event(ref.calendarID, item.seriesID), master.status != "cancelled" else {
+        guard var master = try await api.fullEvent(ref.calendarID, ref.seriesEventID),
+              master["status"] as? String != "cancelled" else {
             throw GoogleError.server(404, "\(item.title) was removed in the meantime.")
         }
-        let lines = master.recurrence ?? []
-        let seriesStart = stored(master)?.start
+        let lines = master["recurrence"] as? [String] ?? []
+        let startField = master["start"] as? [String: Any] ?? [:]
+        let masterStart = GoogleEvent.Time(date: startField["date"] as? String,
+                                           dateTime: startField["dateTime"] as? String,
+                                           timeZone: startField["timeZone"] as? String)
+        let seriesStart = Self.date(masterStart)
+        let allDaySeries = masterStart.date != nil
+        let zone = ref.timeZone ?? masterStart.timeZone
         let here = ref.originalStart ?? item.start
-        var body = Self.body(fields, calendar: calendar)
+        var body = Self.body(fields, calendar: calendar, zone: zone)
 
         if let seriesStart, here <= seriesStart {
             switch recurrence {
@@ -517,7 +621,8 @@ final class GoogleCalendars: CalendarProvider {
             case .clear: body["recurrence"] = [String]()
             case .set(let rule): body["recurrence"] = [RRule.line(rule, allDay: fields.isAllDay)]
             }
-            return try await api.patch(ref.calendarID, master.id, body).id
+            let saved = try await api.patch(ref.calendarID, ref.seriesEventID, body)
+            return Self.key(ref.calendarID, saved.id)
         }
 
         switch recurrence {
@@ -528,7 +633,7 @@ final class GoogleCalendars: CalendarProvider {
             var kept = lines
             if let count = RRule.count(in: lines) {
                 let from = (seriesStart ?? here).addingTimeInterval(-86_400)
-                let before = try await api.instances(ref.calendarID, of: master.id, from: from, to: here,
+                let before = try await api.instances(ref.calendarID, of: ref.seriesEventID, from: from, to: here,
                                                      includingCancelled: true).count
                 kept = RRule.setting(count: count - before, in: lines)
             }
@@ -539,64 +644,76 @@ final class GoogleCalendars: CalendarProvider {
             body["recurrence"] = [RRule.line(rule, allDay: fields.isAllDay)]
         }
 
-        let created = try await api.insert(ref.calendarID, Self.insertable(body))
+        // The new half starts as a copy of the whole series — guests, Meet
+        // link, reminders, colour, attachments — with the change on top.
+        // Google's bookkeeping fields and the old rule stay behind.
+        for field in ["id", "etag", "htmlLink", "iCalUID", "created", "updated", "recurringEventId",
+                      "originalStartTime", "sequence", "kind", "creator", "organizer", "hangoutLink",
+                      "recurrence", "status", "locked", "attendeesOmitted"] {
+            master.removeValue(forKey: field)
+        }
+        for (field, value) in Self.insertable(body) { master[field] = value }
+
+        let created = try await api.insert(ref.calendarID, master)
         do {
-            let ended = RRule.ending(lines, before: here, allDay: master.start?.date != nil, calendar: calendar)
-            _ = try await api.patch(ref.calendarID, master.id, ["recurrence": ended])
+            let ended = RRule.ending(lines, before: here, allDay: allDaySeries, calendar: calendar)
+            _ = try await api.patch(ref.calendarID, ref.seriesEventID, ["recurrence": ended])
         } catch {
             try? await api.delete(ref.calendarID, created.id)
             throw error
         }
-        return created.id
+        return Self.key(ref.calendarID, created.id)
     }
 
     func delete(_ item: EventItem, span: EKSpan) async throws {
         guard case .google(let ref) = item.origin else { return }
-        editedAt[ref.calendarID] = Date()
+        edited(ref.calendarID)
 
         guard item.isRecurring, span == .futureEvents else {
             try await api.delete(ref.calendarID, ref.eventID)
+            edited(ref.calendarID)
             await refetch(ref.calendarID, around: [item.start, item.end], wholeWindow: false)
             return
         }
 
         // This and later: the whole series from its first occurrence, or the
         // series cut short before this one.
-        if let master = try await api.event(ref.calendarID, item.seriesID), master.status != "cancelled" {
+        if let master = try await api.event(ref.calendarID, ref.seriesEventID), master.status != "cancelled" {
             let here = ref.originalStart ?? item.start
             if let seriesStart = stored(master)?.start, here <= seriesStart {
-                try await api.delete(ref.calendarID, master.id)
+                try await api.delete(ref.calendarID, ref.seriesEventID)
             } else {
                 let ended = RRule.ending(master.recurrence ?? [], before: here,
                                          allDay: master.start?.date != nil, calendar: calendar)
-                _ = try await api.patch(ref.calendarID, master.id, ["recurrence": ended])
+                _ = try await api.patch(ref.calendarID, ref.seriesEventID, ["recurrence": ended])
             }
         }
+        edited(ref.calendarID)
         await refetch(ref.calendarID, around: [item.start, item.end], wholeWindow: true)
     }
 
     /// Unsure counts as yes: a colour isn't cleared because the network
     /// dropped for a moment.
     func seriesExists(_ item: EventItem) async -> Bool {
-        guard case .google(let ref) = item.origin else { return false }
+        guard case .google(let ref) = item.origin else { return true }
         do {
-            guard let series = try await api.event(ref.calendarID, item.seriesID) else { return false }
+            guard let series = try await api.event(ref.calendarID, ref.seriesEventID) else { return false }
             return series.status != "cancelled"
         } catch {
             return true
         }
     }
 
-    func occurrence(of item: EventItem, on day: Date) async -> EventItem? {
+    func occurrence(of item: EventItem, on day: Date) async throws -> EventItem? {
         guard case .google(let ref) = item.origin,
               let info = entries.first(where: { $0.id == ref.calendarID }) else { return nil }
         let from = calendar.startOfDay(for: day)
         let to = calendar.date(byAdding: .day, value: 1, to: from) ?? from
         let found: [GoogleEvent]
         if item.isRecurring {
-            found = (try? await api.instances(ref.calendarID, of: item.seriesID, from: from, to: to)) ?? []
+            found = try await api.instances(ref.calendarID, of: ref.seriesEventID, from: from, to: to)
         } else {
-            found = (try? await api.event(ref.calendarID, item.seriesID)).flatMap { $0 }.map { [$0] } ?? []
+            found = try await api.event(ref.calendarID, ref.seriesEventID).map { [$0] } ?? []
         }
         return found.lazy
             .filter { $0.status != "cancelled" }
@@ -605,10 +722,10 @@ final class GoogleCalendars: CalendarProvider {
             .map { self.item($0, in: info, rules: self.caches[info.id]?.rules ?? [:]) }
     }
 
-    func current(_ item: EventItem) async -> EventItem? {
+    func current(_ item: EventItem) async throws -> EventItem? {
         guard case .google(let ref) = item.origin,
               let info = entries.first(where: { $0.id == ref.calendarID }),
-              let event = try? await api.event(ref.calendarID, ref.eventID),
+              let event = try await api.event(ref.calendarID, ref.eventID),
               event.status != "cancelled",
               let stored = stored(event)
         else { return nil }
@@ -622,8 +739,10 @@ final class GoogleCalendars: CalendarProvider {
         let event = stored.event
         let series = event.recurringEventId ?? event.id
         // Someone else's invitation can only be changed if they allowed it.
-        let mine = event.organizer?.isSelf ?? true
-        return EventItem(seriesID: series,
+        // Google leaves `self` out when it's false, so an organizer without
+        // it is someone else.
+        let mine = event.organizer.map { $0.isSelf == true } ?? true
+        return EventItem(seriesID: Self.key(info.id, series),
                          title: event.summary ?? "",
                          start: stored.start,
                          end: stored.end,
@@ -638,12 +757,14 @@ final class GoogleCalendars: CalendarProvider {
                          origin: .google(GoogleEventRef(
                              calendarID: info.id,
                              eventID: event.id,
+                             seriesEventID: series,
                              originalStart: event.originalStartTime.flatMap(Self.date),
+                             timeZone: event.start?.timeZone,
                              rules: rules[series] ?? RRule.rules(event.recurrence))))
     }
 
     /// Working-location markers are left out, as Calendar.app leaves them out.
-    private func stored(_ event: GoogleEvent) -> Stored? {
+    func stored(_ event: GoogleEvent) -> Stored? {
         guard event.status != "cancelled", event.eventType != "workingLocation",
               let start = event.start.flatMap(Self.date) else { return nil }
         if event.start?.date != nil {
@@ -666,7 +787,12 @@ final class GoogleCalendars: CalendarProvider {
     /// The fields Chroma edits, as Google wants them. A switch between timed
     /// and all-day has to clear the other kind of time explicitly, which is
     /// what the nulls are for; a new event leaves them out.
-    static func body(_ fields: EventFields, calendar: Calendar, forInsert: Bool = false) -> [String: Any] {
+    ///
+    /// A timed event keeps the zone it was set in, which its repeats follow —
+    /// a Tokyo series edited from New York stays a Tokyo series. A new one
+    /// takes this Mac's.
+    static func body(_ fields: EventFields, calendar: Calendar, zone: String? = nil,
+                     forInsert: Bool = false) -> [String: Any] {
         var body: [String: Any] = [
             "summary": fields.title,
             "location": fields.location,
@@ -684,9 +810,7 @@ final class GoogleCalendars: CalendarProvider {
             body["start"] = ["date": dayFormatter.string(from: first), "dateTime": NSNull(), "timeZone": NSNull()]
             body["end"] = ["date": dayFormatter.string(from: after), "dateTime": NSNull(), "timeZone": NSNull()]
         } else {
-            // A named zone, which Google needs to repeat an event correctly
-            // across a clock change.
-            let zone = TimeZone.autoupdatingCurrent.identifier
+            let zone = zone ?? TimeZone.autoupdatingCurrent.identifier
             body["start"] = ["dateTime": stampFormatter.string(from: fields.start), "timeZone": zone, "date": NSNull()]
             body["end"] = ["dateTime": stampFormatter.string(from: max(fields.end, fields.start)),
                            "timeZone": zone, "date": NSNull()]

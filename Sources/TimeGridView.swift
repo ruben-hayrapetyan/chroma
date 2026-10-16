@@ -255,8 +255,10 @@ struct DayColumn: View {
 
     private func block(_ placed: PositionedEvent, width: CGFloat) -> some View {
         let span = placed.item.clockSpan(on: day, in: store.calendar)
-        let minutes = span.start
-        let height = max(CGFloat(max(span.end - span.start, 15)) / 60 * Theme.hourHeight, 16)
+        let height = max(CGFloat(max(span.end - span.start, EventLayout.shortestMinutes)) / 60 * Theme.hourHeight, 16)
+        // A block given its minimum height late in the evening would run off
+        // the bottom of the day; it sits higher instead, so it's all there.
+        let minutes = min(span.start, Double((Theme.hourHeight * 24 - height) / Theme.hourHeight * 60))
         let inset: CGFloat = 3
         let usable = width - inset * 2
         let columnWidth = usable / CGFloat(placed.columnCount)

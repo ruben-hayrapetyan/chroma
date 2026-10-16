@@ -126,6 +126,25 @@ struct RecurrenceDraft: Equatable {
             && (rule.setPositions ?? []).isEmpty
     }
 
+    /// The rule a weekly series needs once its event moves to another
+    /// weekday, or nil when it needs nothing. Only a rule on the one weekday
+    /// the event used to fall on follows it: "Mon, Wed" moved to a Tuesday
+    /// says nothing about which day should change.
+    static func following(_ rules: [EKRecurrenceRule]?, from old: Date, to new: Date,
+                          calendar: Calendar) -> EKRecurrenceRule? {
+        guard let rules, rules.count == 1, let rule = rules.first, rule.frequency == .weekly,
+              let days = rule.daysOfTheWeek, days.count == 1, days[0].weekNumber == 0,
+              days[0].dayOfTheWeek.rawValue == calendar.component(.weekday, from: old)
+        else { return nil }
+        let weekday = calendar.component(.weekday, from: new)
+        guard weekday != days[0].dayOfTheWeek.rawValue, let day = EKWeekday(rawValue: weekday) else { return nil }
+        return EKRecurrenceRule(recurrenceWith: .weekly, interval: rule.interval,
+                                daysOfTheWeek: [EKRecurrenceDayOfWeek(day)],
+                                daysOfTheMonth: nil, monthsOfTheYear: nil,
+                                weeksOfTheYear: nil, daysOfTheYear: nil,
+                                setPositions: nil, end: rule.recurrenceEnd)
+    }
+
     /// "Weekly on Mon, Wed until 19 Dec" — shown when the editor is collapsed.
     var summary: String {
         guard repeats else { return "Never" }

@@ -75,12 +75,14 @@ protocol CalendarProvider: AnyObject {
                 span: EKSpan) async throws -> String?
     func delete(_ item: EventItem, span: EKSpan) async throws
 
-    /// Whether any of the item's series is left.
+    /// Whether any of the item's series is left. Unsure counts as yes.
     func seriesExists(_ item: EventItem) async -> Bool
-    /// The occurrence of the item's series on a given day, read fresh.
-    func occurrence(of item: EventItem, on day: Date) async -> EventItem?
-    /// The item as the calendar has it now, or nil once it's gone.
-    func current(_ item: EventItem) async -> EventItem?
+    /// The occurrence of the item's series on a given day, read fresh. Nil
+    /// when there's none; throws when the calendar couldn't be asked.
+    func occurrence(of item: EventItem, on day: Date) async throws -> EventItem?
+    /// The item as the calendar has it now, or nil once it's gone. Throws
+    /// when the calendar couldn't be asked, which isn't the same as gone.
+    func current(_ item: EventItem) async throws -> EventItem?
 
     /// Nudges the accounts to sync, for a calendar that's expected but missing.
     func refreshSources()

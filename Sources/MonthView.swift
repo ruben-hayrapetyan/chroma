@@ -120,10 +120,11 @@ struct MonthDayCell: View {
         .overlay(alignment: .leading) { Rectangle().fill(Theme.hairline).frame(width: 0.5) }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        // An ordinary gesture, not a simultaneous one: a double-click on an
+        // event chip edits the event, and the chip's own gesture wins over
+        // this one instead of both firing and dropping into Day view.
+        .onTapGesture(count: 2) { store.focus(on: day, switchingTo: .day) }
         .onTapGesture { store.selectedDay = calendar.startOfDay(for: day) }
-        .simultaneousGesture(TapGesture(count: 2).onEnded {
-            store.focus(on: day, switchingTo: .day)
-        })
         .contextMenu {
             Button("New Event Here") { onAdd(calendar.startOfDay(for: day)) }
             Button("Open This Day") { store.focus(on: day, switchingTo: .day) }

@@ -181,6 +181,7 @@ final class ClaudeRunner: ObservableObject {
 
     private func finish(run id: Int) {
         guard id == runID, isRunning else { return }
+        runID += 1                  // and anything still in the pipe after it
         process = nil
         if let status = exitStatus, status != 0 {
             if transcript.localizedCaseInsensitiveContains("unknown option") {
@@ -201,12 +202,17 @@ final class ClaudeRunner: ObservableObject {
     /// The request, the calendar, and the shape of the reply.
     private static func fullPrompt(request: String, day: Date, calendarName: String,
                                    snapshot: String, coverage: String) -> String {
+        // Gregorian and English whatever the Mac is set to, to match the
+        // snapshot's dates — a Buddhist or Islamic "today" would send every
+        // "tomorrow" somewhere else.
         let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
         formatter.dateFormat = "EEEE, MMMM d, yyyy"
 
         return """
         You are the assistant inside Chroma, a macOS calendar app, working on the \
-        calendar named "\(calendarName)".
+        calendar named "\(ClaudePanel.flat(calendarName))".
 
         You have NO tools. Do not try to run commands or read files. You act by \
         returning a plan, which the app applies for you.
@@ -282,9 +288,14 @@ struct ClaudePanel: View {
     /// reply attached to the question that produced it.
     @State private var lastRequest = ""
     @State private var snapshot: [EventItem] = []
-    @State private var applied: [String] = []
+    @State private var applied: [PlanApplier.Outcome] = []
     /// The plan going into the calendar, one change at a time.
     @State private var applying = false
+    /// A plan that changes or removes events, waiting for Apply. Titles in the
+    /// snapshot come from invitations anyone can send, so nothing already on
+    /// the calendar changes until the user has seen what will.
+    @State private var pending: ClaudePlan?
+    @State private var pendingLines: [String] = []
     /// Why a finished reply changed nothing, when Claude's own sentence
     /// might say otherwise.
     @State private var problem: String?
@@ -324,7 +335,7 @@ struct ClaudePanel: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 20)
                     .padding(.top, 12)
-            } else if !runner.transcript.isEmpty || runner.isRunning || applying
+            } else if !runner.transcript.isEmpty || runner.isRunning || applying || pending != nil
                 || runner.failure != nil || problem != nil || !applied.isEmpty {
                 transcriptArea
             }
@@ -386,12 +397,30 @@ struct ClaudePanel: View {
             if !applied.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(applied, id: \.self) { line in
-                        Label(line, systemImage: "checkmark.circle")
+                        Label(line.text, systemImage: line.ok ? "checkmark.circle" : "exclamationmark.circle")
+                            .font(Theme.ui(11))
+                            .foregroundStyle(line.ok ? Theme.ink : .orange)
+                    }
+                }
+                .padding(.bottom, 2)
+            }
+            if pending != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("CLAUDE WANTS TO")
+                        .font(Theme.eyebrow)
+                        .foregroundStyle(Theme.graphite)
+                    ForEach(Array(pendingLines.enumerated()), id: \.offset) { _, line in
+                        Label(line, systemImage: "circle")
                             .font(Theme.ui(11))
                             .foregroundStyle(Theme.ink)
                     }
                 }
-                .padding(.bottom, 2)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.rule, lineWidth: 0.5)
+                )
             }
             if let failure = runner.failure ?? problem {
                 Label(failure, systemImage: "exclamationmark.triangle")
@@ -418,6 +447,10 @@ struct ClaudePanel: View {
                 Text(applying ? "Making the changes…" : "Claude is working…")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.graphite)
+            } else if pending != nil {
+                Text("Nothing has changed yet. Apply to make these changes.")
+                    .font(Theme.ui(11))
+                    .foregroundStyle(Theme.graphite)
             } else {
                 HStack(spacing: 5) {
                     Text("⌘↩")
@@ -435,19 +468,29 @@ struct ClaudePanel: View {
                 }
             }
             Spacer()
-            if runner.isRunning {
-                Button("Stop") { runner.cancel() }
-            } else {
-                Button("Close") { dismiss() }
+            if let plan = pending {
+                Button("Discard") { discard() }
                     .keyboardShortcut(.cancelAction)
+                Button("Apply Changes") { apply(plan) }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                    .help("Apply Claude's changes (⌘↩)")
+            } else {
+                if runner.isRunning {
+                    Button("Stop") { runner.cancel() }
+                } else {
+                    Button("Close") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                Button("Send") { send() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                    .help("Send to Claude (⌘↩)")
+                    .disabled(runner.isRunning || applying || ClaudeRunner.executable == nil
+                              || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            Button("Send") { send() }
-                .keyboardShortcut(.return, modifiers: .command)
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
-                .help("Send to Claude (⌘↩)")
-                .disabled(runner.isRunning || applying || ClaudeRunner.executable == nil
-                          || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(16)
     }
@@ -457,6 +500,7 @@ struct ClaudePanel: View {
         guard !request.isEmpty else { return }
         applied = []
         problem = nil
+        pending = nil
         lastRequest = request
         prompt = ""                 // ready for the next one
         promptFocused = true
@@ -476,11 +520,32 @@ struct ClaudePanel: View {
             problem = reply.problem
             return
         }
+        if let invalid = PlanApplier.problem(in: plan, snapshot: snapshot, store: store) {
+            problem = invalid
+            return
+        }
+        if plan.changesExisting {
+            pending = plan
+            pendingLines = PlanApplier.preview(plan, snapshot: snapshot)
+        } else if !plan.operations.isEmpty {
+            apply(plan)
+        }
+    }
+
+    private func apply(_ plan: ClaudePlan) {
+        pending = nil
+        pendingLines = []
         applying = true
         Task {
             applied = await PlanApplier.apply(plan, snapshot: snapshot, store: store, colors: colors)
             applying = false
         }
+    }
+
+    private func discard() {
+        pending = nil
+        pendingLines = []
+        applied = [.failed("Discarded. Nothing was changed.")]
     }
 
     /// The most lines a snapshot carries. Past this the prompt gets slow and
@@ -501,8 +566,12 @@ struct ClaudePanel: View {
     private func buildSnapshot() -> (items: [EventItem], coverage: String) {
         let calendar = store.calendar
         let day = calendar.startOfDay(for: store.selectedDay)
-        let from = calendar.date(byAdding: .month, value: -5, to: day) ?? day
-        let to = calendar.date(byAdding: .month, value: 7, to: day) ?? day
+        // Never past what's loaded — two years either side of today — or the
+        // coverage line would call unloaded months free.
+        let loadedFrom = calendar.date(byAdding: .year, value: -2, to: Date()) ?? day
+        let loadedTo = calendar.date(byAdding: .year, value: 2, to: Date()) ?? day
+        let from = max(calendar.date(byAdding: .month, value: -5, to: day) ?? day, loadedFrom)
+        let to = max(min(calendar.date(byAdding: .month, value: 7, to: day) ?? day, loadedTo), from)
 
         var lines: [EventItem] = []
         var lineOfSeries: [String: Int] = [:]
@@ -523,6 +592,8 @@ struct ClaudePanel: View {
         }
 
         let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
         formatter.dateFormat = "MMMM d, yyyy"
         func range(_ first: Date, _ last: Date) -> String {
             "Their calendar from \(formatter.string(from: first)) to \(formatter.string(from: last)), numbered so you can refer to an entry."
@@ -552,12 +623,24 @@ struct ClaudePanel: View {
             let when = item.isAllDay
                 ? "\(day.string(from: item.start)) all-day"
                 : "\(day.string(from: item.start)) \(clock.string(from: item.start))-\(clock.string(from: item.end))"
-            let place = item.location.isEmpty ? "" : " · \(item.location)"
+            let place = item.location.isEmpty ? "" : " · \(Self.flat(item.location))"
             let repeats = item.isRecurring ? " · repeats" : ""
             let tag = Categories.category(for: item).map { " [\($0.slug)]" } ?? ""
-            let elsewhere = item.calendarID == mainID ? "" : " · read-only, on \"\(item.calendarTitle)\""
-            return "        #\(index + 1)  \(when)  \(item.title)\(place)\(repeats)\(elsewhere)\(tag)"
+            let elsewhere = item.calendarID == mainID ? "" : " · read-only, on \"\(Self.flat(item.calendarTitle))\""
+            return "        #\(index + 1)  \(when)  \(Self.flat(item.title))\(place)\(repeats)\(elsewhere)\(tag)"
         }.joined(separator: "\n")
+    }
+
+    /// Text from a calendar, made safe for one line of the snapshot: line
+    /// breaks and tabs become spaces, so a title can't start a line of its own
+    /// that reads like part of the prompt, and an overlong one is cut short.
+    static func flat(_ text: String) -> String {
+        let line = String(String.UnicodeScalarView(text.unicodeScalars.map {
+            CharacterSet.controlCharacters.contains($0) ? " " : $0
+        }))
+        .split(whereSeparator: \.isWhitespace)
+        .joined(separator: " ")
+        return line.count > 160 ? String(line.prefix(159)) + "…" : line
     }
 
     private var dayLabel: String {
