@@ -1,4 +1,3 @@
-import EventKit
 import SwiftUI
 
 /// The two toggles this copy of Chroma was built around, kept on the
@@ -25,8 +24,8 @@ extension EventStore {
         extraCalendars.first { Personal.isLibrary($0.ref.title) }
     }
 
-    /// The library calendar on this Mac, connected or not.
-    var libraryCalendar: EKCalendar? {
+    /// The library calendar where the source can see it, connected or not.
+    var libraryCalendar: CalendarInfo? {
         calendarGroups().flatMap(\.calendars).first { Personal.isLibrary($0.title) }
     }
 
@@ -62,12 +61,14 @@ struct PersonalToggles: View {
             }
         }
 
-        // Says so in its tooltip when the calendar hasn't reached this Mac,
-        // since otherwise switching it on would silently do nothing.
+        // Says so in its tooltip when the calendar can't be seen yet, since
+        // otherwise switching it on would silently do nothing.
         GlyphButton(
             systemName: store.showsLibraryRooms ? "books.vertical.fill" : "books.vertical",
             help: store.libraryCalendar == nil
-                ? "No \u{201C}\(Personal.libraryCalendarTitle)\u{201D} calendar on this Mac yet — enable it under your Google account in Calendar.app"
+                ? (store.source == .google
+                    ? "No \u{201C}\(Personal.libraryCalendarTitle)\u{201D} calendar in your Google account yet — subscribe to it in Google Calendar"
+                    : "No \u{201C}\(Personal.libraryCalendarTitle)\u{201D} calendar on this Mac yet — enable it under your Google account in Calendar.app")
                 : store.showsLibraryRooms
                     ? "Hide library rooms (⇧⌘L)"
                     : "Show library rooms (⇧⌘L)"
