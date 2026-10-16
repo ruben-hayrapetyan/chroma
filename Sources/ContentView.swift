@@ -107,19 +107,32 @@ struct ContentView: View {
         Categories.apply(store.allKnownItems(), colors: colors)
     }
 
+    /// First launch asks where the calendars are; then each source has its
+    /// own way in — macOS's permission, or a Google sign-in — before the
+    /// main calendar is picked.
     @ViewBuilder
     private var stage: some View {
-        switch store.access {
-        case .pending:
-            notice("Waiting for calendar access",
-                   detail: "macOS should be asking permission right about now.",
-                   symbol: "hourglass")
-        case .denied(let reason):
-            notice("No calendar access", detail: reason, symbol: "lock.fill")
-        case .granted where store.targetCalendar == nil:
-            CalendarChooser()
-        case .granted:
-            main
+        if store.source == nil {
+            SourceChooser()
+        } else {
+            switch store.access {
+            case .pending where store.source == .google:
+                notice("Connecting to Google",
+                       detail: "Checking your sign-in and loading your calendars.",
+                       symbol: "hourglass")
+            case .pending:
+                notice("Waiting for calendar access",
+                       detail: "macOS should be asking permission right about now.",
+                       symbol: "hourglass")
+            case .denied(let reason):
+                notice("No calendar access", detail: reason, symbol: "lock.fill")
+            case .signedOut, .unreachable:
+                GoogleSignIn()
+            case .granted where store.targetCalendar == nil:
+                CalendarChooser()
+            case .granted:
+                main
+            }
         }
     }
 
@@ -300,7 +313,7 @@ struct ContentView: View {
         return Menu {
             ForEach(store.extraCalendars) { extra in
                 Toggle(store.resolve(extra.ref) == nil
-                           ? "\(extra.ref.title) — not on this Mac"
+                           ? "\(extra.ref.title) — \(store.source == .google ? "not in your Google account" : "not on this Mac")"
                            : extra.ref.title,
                        isOn: Binding(get: { extra.isShown },
                                      set: { store.setShown(extra.id, $0) }))
@@ -341,10 +354,10 @@ struct ContentView: View {
     }
 
     /// The pigment a calendar's events wear when it has one, otherwise the
-    /// calendar's own colour. Nil when it isn't on this Mac.
+    /// calendar's own colour. Nil when it can't be found.
     private func swatchColor(for extra: ExtraCalendar) -> Color? {
         if let pigment = EventColor.named(extra.colorID) { return pigment.color }
-        return store.resolve(extra.ref).map { Color(cgColor: $0.cgColor) }
+        return store.resolve(extra.ref).map(\.color)
     }
 
     private func heading(pinned: Bool) -> some View {
@@ -471,6 +484,15 @@ struct Sidebar: View {
                 Spacer()
             }
             .padding(.top, 16)
+
+            // Google out of reach: what's drawn is what was last fetched, and
+            // changes won't go through until it's back.
+            if let problem = store.syncProblem {
+                Label("Offline — showing what was last loaded", systemImage: "icloud.slash")
+                    .font(Theme.ui(10.5))
+                    .foregroundStyle(.orange)
+                    .help(problem)
+            }
 
             searchField
 

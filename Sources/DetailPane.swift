@@ -26,6 +26,9 @@ struct DetailPane: View {
     /// can't flatten a pattern the editor has no controls for.
     @State private var seededRecurrence = RecurrenceDraft()
     @State private var error: String?
+    /// A save or delete on its way to the calendar — Google's go over the
+    /// network, and a second press would send the change twice.
+    @State private var working = false
     @State private var confirmingDelete = false
     @FocusState private var titleFocused: Bool
 
@@ -138,7 +141,7 @@ struct DetailPane: View {
             if item.isRecurring {
                 field("Repeats", systemImage: "repeat", value: "Part of a repeating series")
             }
-            if item.calendarID != store.targetCalendar?.calendarIdentifier {
+            if item.calendarID != store.targetCalendar?.id {
                 field("Calendar", systemImage: "calendar", value: item.calendarTitle)
             }
             if !item.notes.isEmpty {
@@ -182,7 +185,7 @@ struct DetailPane: View {
 
             RecurrenceEditor(draft: $recurrence)
 
-            if !RecurrenceDraft.canShow(item.ekEvent.recurrenceRules) {
+            if !RecurrenceDraft.canShow(item.recurrenceRules) {
                 Label("This repeats in a pattern the editor can't show. It's kept as long as Repeat is left alone.",
                       systemImage: "info.circle")
                     .font(.system(size: 10))
@@ -218,7 +221,7 @@ struct DetailPane: View {
     }
 
     /// Colour applies immediately in both modes — it is not part of the event as
-    /// EventKit sees it, so there is nothing to save.
+    /// the calendar sees it, so there is nothing to save.
     private var swatches: some View {
         VStack(alignment: .leading, spacing: 7) {
             label("Colour", systemImage: "paintpalette")
@@ -257,20 +260,22 @@ struct DetailPane: View {
                 Button("Cancel") { isEditing = false }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
+                if working { ProgressView().controlSize(.small) }
                 Button("Save") { save() }
                     .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(working || title.trimmingCharacters(in: .whitespaces).isEmpty)
             } else if item.isEditable {
                 Button("Delete", role: .destructive) { confirmingDelete = true }
+                    .disabled(working)
                 Spacer()
                 Button("Edit") { isEditing = true }
                     .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
             } else {
-                // Subscriptions and calendars shared view-only: EventKit would
-                // refuse the save, so there is nothing to offer but the colour.
+                // Subscriptions and calendars shared view-only: the calendar
+                // would refuse the save, so there is nothing to offer but the colour.
                 Label("\(item.calendarTitle) is read-only", systemImage: "lock")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.graphite)
@@ -289,31 +294,42 @@ struct DetailPane: View {
         isAllDay = item.isAllDay
         location = item.location
         notes = item.notes
-        recurrence = RecurrenceDraft.from(item.ekEvent.recurrenceRules?.first)
+        recurrence = RecurrenceDraft.from(item.recurrenceRules?.first)
         seededRecurrence = recurrence
     }
 
     private func save() {
         let cleaned = title.trimmingCharacters(in: .whitespaces)
-        guard !cleaned.isEmpty else { return }
-        do {
-            let savedID = try store.update(item, title: cleaned, start: start, end: end,
-                                           isAllDay: isAllDay, location: location, notes: notes,
-                                           recurrence: recurrence == seededRecurrence ? .unchanged : recurrence.edit)
-            colors.carry(from: item.seriesID, to: savedID)
-            isEditing = false
-        } catch {
-            self.error = error.localizedDescription
+        guard !cleaned.isEmpty, !working else { return }
+        let item = item
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                let savedID = try await store.update(item, title: cleaned, start: start, end: end,
+                                                     isAllDay: isAllDay, location: location, notes: notes,
+                                                     recurrence: recurrence == seededRecurrence ? .unchanged : recurrence.edit)
+                colors.carry(from: item.seriesID, to: savedID)
+                isEditing = false
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 
     private func performDelete() {
-        do {
-            try store.delete(item)
-            if !store.seriesExists(item.seriesID) { colors.set(nil, for: item.seriesID) }
-            onClose()
-        } catch {
-            self.error = error.localizedDescription
+        guard !working else { return }
+        let item = item
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                try await store.delete(item)
+                if !(await store.seriesExists(item)) { colors.set(nil, for: item.seriesID) }
+                onClose()
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 

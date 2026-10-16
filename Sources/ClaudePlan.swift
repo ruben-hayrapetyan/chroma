@@ -5,9 +5,10 @@ import Foundation
 ///
 /// Claude no longer touches the calendar itself. It reads a snapshot handed to
 /// it in the prompt and replies with operations; Chroma applies them through
-/// EventKit, which it already has permission for. That removes AppleScript from
-/// the loop entirely — which is what used to launch Calendar.app and leave it
-/// sitting in the Dock — and it means the session needs no tools at all.
+/// whichever source it reads from, Apple Calendar or Google, which it already
+/// has permission for. That removes AppleScript from the loop entirely — which
+/// is what used to launch Calendar.app and leave it sitting in the Dock — and
+/// it means the session needs no tools at all.
 struct ClaudeOperation: Decodable {
     let op: String                 // create | update | delete
     var ref: Int?                  // the #n of an event in the snapshot
@@ -50,8 +51,8 @@ struct ClaudeOperation: Decodable {
 
 /// "Weekly until December 19" and friends.
 ///
-/// Structured rather than an RRULE string, because EventKit has no public way to
-/// parse one — `EKRecurrenceRule` has to be built up from parts.
+/// Structured rather than an RRULE string: the parts are easy for Claude to get
+/// right, and become the same `EKRecurrenceRule` the editor builds.
 struct ClaudeRecurrence: Decodable {
     let freq: String               // daily | weekly | monthly | yearly
     var interval: Int?             // every n periods, default 1
@@ -153,17 +154,19 @@ enum PlanApplier {
     /// `snapshot` is the same list, in the same order, that the prompt showed —
     /// so a `ref` of 3 means the same event on both sides.
     static func apply(_ plan: ClaudePlan, snapshot: [EventItem],
-                      store: EventStore, colors: EventColors) -> [String] {
+                      store: EventStore, colors: EventColors) async -> [String] {
         var report: [String] = []
 
+        // In order, each finished before the next: a move can arrive as a
+        // delete and a create, and a later step can depend on an earlier one.
         for operation in plan.operations {
             switch operation.op.lowercased() {
             case "create":
-                report.append(create(operation, store: store, colors: colors))
+                report.append(await create(operation, store: store, colors: colors))
             case "update":
-                report.append(update(operation, snapshot: snapshot, store: store, colors: colors))
+                report.append(await update(operation, snapshot: snapshot, store: store, colors: colors))
             case "delete":
-                report.append(delete(operation, snapshot: snapshot, store: store, colors: colors))
+                report.append(await delete(operation, snapshot: snapshot, store: store, colors: colors))
             default:
                 report.append("Ignored an unknown operation \"\(operation.op)\".")
             }
@@ -172,7 +175,7 @@ enum PlanApplier {
     }
 
     private static func create(_ operation: ClaudeOperation,
-                               store: EventStore, colors: EventColors) -> String {
+                               store: EventStore, colors: EventColors) async -> String {
         guard let title = operation.title, !title.isEmpty else {
             return "Skipped a new event with no title."
         }
@@ -186,11 +189,11 @@ enum PlanApplier {
 
         let rule = operation.recurrence?.rule(parsingDate: date)
         do {
-            let seriesID = try store.create(title: title, start: start, end: end,
-                                            isAllDay: allDay,
-                                            location: operation.location ?? "",
-                                            notes: operation.notes ?? "",
-                                            recurrence: rule)
+            let seriesID = try await store.create(title: title, start: start, end: end,
+                                                  isAllDay: allDay,
+                                                  location: operation.location ?? "",
+                                                  notes: operation.notes ?? "",
+                                                  recurrence: rule)
             if let seriesID, let category = category(operation.category) {
                 colors.set(EventColor.named(category.pigmentID), for: seriesID)
                 return "Added \(title) — \(when(start, allDay))\(repeats(rule)), \(category.name.lowercased())."
@@ -202,7 +205,7 @@ enum PlanApplier {
     }
 
     private static func update(_ operation: ClaudeOperation, snapshot: [EventItem],
-                               store: EventStore, colors: EventColors) -> String {
+                               store: EventStore, colors: EventColors) async -> String {
         guard let shown = resolve(operation.ref, in: snapshot) else {
             return "Couldn't find the event to change."
         }
@@ -216,13 +219,13 @@ enum PlanApplier {
             // One at a time, looked up fresh: saving one occurrence leaves
             // the series' other fetched occurrences out of date.
             for day in days {
-                guard let occurrence = store.occurrence(ofSeries: shown.seriesID, on: day) else {
+                guard let occurrence = await store.occurrence(of: shown, on: day) else {
                     problems.append("not on \(shortDay(day))")
                     continue
                 }
                 do {
-                    try save(operation, to: occurrence, movedFrom: days[0], span: .thisEvent,
-                             store: store, colors: colors)
+                    try await save(operation, to: occurrence, movedFrom: days[0], span: .thisEvent,
+                                   store: store, colors: colors)
                     changed.append(day)
                 } catch {
                     problems.append("\(shortDay(day)): \(error.localizedDescription)")
@@ -240,12 +243,12 @@ enum PlanApplier {
         // Read again first: Claude worked from a copy that's a minute or so
         // old, and anything it didn't mention should keep its current value,
         // not the one in that copy.
-        guard let current = refreshed(shown, store: store) else {
+        guard let current = await store.current(shown) else {
             return "Couldn't change \(shown.title) — it was removed in the meantime."
         }
         do {
-            let (start, allDay) = try save(operation, to: current, movedFrom: shown.start, span: nil,
-                                           store: store, colors: colors)
+            let (start, allDay) = try await save(operation, to: current, movedFrom: shown.start, span: nil,
+                                                 store: store, colors: colors)
             return "Changed \(operation.title ?? current.title) — now \(when(start, allDay))."
         } catch {
             return "Couldn't change \(current.title): \(error.localizedDescription)"
@@ -258,7 +261,7 @@ enum PlanApplier {
     @discardableResult
     private static func save(_ operation: ClaudeOperation, to item: EventItem, movedFrom base: Date,
                              span: EKSpan?, store: EventStore,
-                             colors: EventColors) throws -> (start: Date, allDay: Bool) {
+                             colors: EventColors) async throws -> (start: Date, allDay: Bool) {
         let calendar = store.calendar
         let allDay = operation.allDay ?? item.isAllDay
         let start = date(operation.start).map { moved(item.start, from: base, to: $0, calendar: calendar) }
@@ -268,14 +271,14 @@ enum PlanApplier {
                 ? start.addingTimeInterval(item.end.timeIntervalSince(item.start))
                 : item.end)
 
-        let savedID = try store.update(item,
-                                       title: operation.title ?? item.title,
-                                       start: start, end: max(end, start), isAllDay: allDay,
-                                       location: operation.location ?? item.location,
-                                       notes: operation.notes ?? item.notes,
-                                       recurrence: operation.recurrence?.rule(parsingDate: date)
-                                           .map(RecurrenceEdit.set) ?? .unchanged,
-                                       span: span)
+        let savedID = try await store.update(item,
+                                             title: operation.title ?? item.title,
+                                             start: start, end: max(end, start), isAllDay: allDay,
+                                             location: operation.location ?? item.location,
+                                             notes: operation.notes ?? item.notes,
+                                             recurrence: operation.recurrence?.rule(parsingDate: date)
+                                                 .map(RecurrenceEdit.set) ?? .unchanged,
+                                             span: span)
         colors.carry(from: item.seriesID, to: savedID)
         if let category = category(operation.category) {
             colors.set(EventColor.named(category.pigmentID), for: savedID ?? item.seriesID)
@@ -284,24 +287,24 @@ enum PlanApplier {
     }
 
     private static func delete(_ operation: ClaudeOperation, snapshot: [EventItem],
-                               store: EventStore, colors: EventColors) -> String {
+                               store: EventStore, colors: EventColors) async -> String {
         guard let item = resolve(operation.ref, in: snapshot) else {
             return "Couldn't find the event to remove."
         }
         guard isOnMain(item, store: store) else { return leftAlone(item) }
 
         // Named dates mean single occurrences; resolved one at a time, because
-        // each removal invalidates the rest of the series' fetched objects.
+        // each removal leaves the rest of the series' fetched copies stale.
         if let dates = operation.occurrences?.compactMap(date), !dates.isEmpty {
             var removed: [Date] = []
             var missed = 0
             for day in dates {
-                guard let occurrence = store.occurrence(ofSeries: item.seriesID, on: day) else {
+                guard let occurrence = await store.occurrence(of: item, on: day) else {
                     missed += 1
                     continue
                 }
                 do {
-                    try store.delete(occurrence, span: .thisEvent)
+                    try await store.delete(occurrence, span: .thisEvent)
                     removed.append(day)
                 } catch {
                     missed += 1
@@ -315,30 +318,20 @@ enum PlanApplier {
             return "Removed \(item.title) on \(list)\(tail)."
         }
 
-        guard let current = refreshed(item, store: store) else {
+        guard let current = await store.current(item) else {
             return "\(item.title) was already gone."
         }
         do {
             // A series goes from the occurrence shown onwards; earlier ones
             // stay, as a record of what happened.
-            try store.delete(current)
-            if !store.seriesExists(current.seriesID) { colors.set(nil, for: current.seriesID) }
+            try await store.delete(current)
+            if !(await store.seriesExists(current)) { colors.set(nil, for: current.seriesID) }
             return current.isRecurring
                 ? "Removed \(current.title) from \(shortDay(current.start)) on."
                 : "Removed \(current.title)."
         } catch {
             return "Couldn't remove \(current.title): \(error.localizedDescription)"
         }
-    }
-
-    /// The event as the calendar has it now, or nil if it has since been
-    /// deleted. Falls back to looking the occurrence up again, for when an
-    /// earlier step of the same plan left the fetched copy unusable.
-    private static func refreshed(_ item: EventItem, store: EventStore) -> EventItem? {
-        if item.ekEvent.refresh() {
-            return EventItem(item.ekEvent, calendarColorID: item.calendarColorID)
-        }
-        return store.occurrence(ofSeries: item.seriesID, on: item.start)
     }
 
     /// `date` moved the way `base` moved to `target`: the same number of days
@@ -357,7 +350,7 @@ enum PlanApplier {
     /// in the snapshot so it can see what a day holds — and some are shared,
     /// where a wrong guess would delete someone else's booking.
     private static func isOnMain(_ item: EventItem, store: EventStore) -> Bool {
-        item.calendarID == store.targetCalendar?.calendarIdentifier
+        item.calendarID == store.targetCalendar?.id
     }
 
     private static func leftAlone(_ item: EventItem) -> String {

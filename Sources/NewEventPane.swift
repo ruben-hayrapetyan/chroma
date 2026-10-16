@@ -19,6 +19,9 @@ struct NewEventPane: View {
     let onClose: () -> Void
 
     @State private var error: String?
+    /// The new event on its way to the calendar, so a second press of Create
+    /// doesn't make it twice.
+    @State private var creating = false
     @FocusState private var titleFocused: Bool
 
     /// A binding into one field of the draft that refuses to write once the
@@ -160,33 +163,38 @@ struct NewEventPane: View {
             Button("Cancel", action: onClose)
                 .keyboardShortcut(.cancelAction)
             Spacer()
+            if creating { ProgressView().controlSize(.small) }
             Button("Create") { create() }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(current.title.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(creating || current.title.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(14)
     }
 
     private func create() {
-        guard let value = draft else { return }
+        guard let value = draft, !creating else { return }
         let title = value.title.trimmingCharacters(in: .whitespaces)
         guard !title.isEmpty else { return }
-        do {
-            let seriesID = try store.create(title: title,
-                                            start: value.start,
-                                            end: value.end,
-                                            isAllDay: value.isAllDay,
-                                            location: value.location,
-                                            notes: value.notes,
-                                            recurrence: value.recurrence.rule)
-            if let seriesID, let colorID = value.colorID {
-                colors.set(EventColor.named(colorID), for: seriesID)
+        creating = true
+        Task {
+            defer { creating = false }
+            do {
+                let seriesID = try await store.create(title: title,
+                                                      start: value.start,
+                                                      end: value.end,
+                                                      isAllDay: value.isAllDay,
+                                                      location: value.location,
+                                                      notes: value.notes,
+                                                      recurrence: value.recurrence.rule)
+                if let seriesID, let colorID = value.colorID {
+                    colors.set(EventColor.named(colorID), for: seriesID)
+                }
+                onClose()
+            } catch {
+                self.error = error.localizedDescription
             }
-            onClose()
-        } catch {
-            self.error = error.localizedDescription
         }
     }
 }

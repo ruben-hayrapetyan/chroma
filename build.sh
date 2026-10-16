@@ -4,6 +4,10 @@
 #
 # Universal by default, so one download runs on Apple silicon and Intel Macs
 # alike. ARCHS="arm64" ./build.sh builds just one, which halves the compile.
+#
+# GOOGLE_CLIENT_JSON=path/to/client.json builds a Google OAuth client into
+# the app, so Google Calendar works without choosing a client file. Without it
+# the app reads one from Application Support. Either way it never goes in git.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -49,6 +53,15 @@ if [ -f tools/MakeIcon.swift ]; then
   rm -rf "$ICONSET"
 fi
 
+GOOGLE_KEYS=""
+if [ -n "${GOOGLE_CLIENT_JSON:-}" ]; then
+  echo "==> Building in the Google client from $GOOGLE_CLIENT_JSON"
+  CLIENT_ID=$(plutil -extract installed.client_id raw -o - "$GOOGLE_CLIENT_JSON")
+  CLIENT_SECRET=$(plutil -extract installed.client_secret raw -o - "$GOOGLE_CLIENT_JSON" 2>/dev/null || true)
+  GOOGLE_KEYS="    <key>ChromaGoogleClientID</key>      <string>$CLIENT_ID</string>
+    <key>ChromaGoogleClientSecret</key>  <string>$CLIENT_SECRET</string>"
+fi
+
 echo "==> Writing Info.plist"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,6 +83,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>Chroma shows the calendars you choose and adds and edits events on the one you pick as your main calendar.</string>
     <key>NSCalendarsUsageDescription</key>
     <string>Chroma shows the calendars you choose and adds and edits events on the one you pick as your main calendar.</string>
+$GOOGLE_KEYS
 </dict>
 </plist>
 PLIST
