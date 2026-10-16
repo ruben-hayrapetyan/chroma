@@ -65,6 +65,20 @@ struct ClaudeRecurrence: Decodable {
         "TH": .thursday, "FR": .friday, "SA": .saturday,
     ]
 
+    /// What's wrong with it, in words, or nil when it reads. A plan carrying
+    /// one of these isn't applied: an end date that can't be read would
+    /// otherwise make a series that never ends.
+    func problem(parsingDate: (String?) -> Date?) -> String? {
+        guard ["daily", "weekly", "monthly", "yearly", "annually"].contains(freq.lowercased()) else {
+            return "repeats \u{201C}\(freq)\u{201D}, which isn't a frequency Chroma knows"
+        }
+        if let until, parsingDate(until) == nil {
+            return "repeats until \u{201C}\(until)\u{201D}, a date Chroma can't read"
+        }
+        if let count, count < 1 { return "repeats \(count) times" }
+        return nil
+    }
+
     /// Nil if the frequency is unreadable — better to create a single event than
     /// to invent a repeat nobody asked for.
     func rule(parsingDate: (String?) -> Date?) -> EKRecurrenceRule? {
@@ -101,6 +115,12 @@ struct ClaudeRecurrence: Decodable {
 
 struct ClaudePlan: Decodable {
     let operations: [ClaudeOperation]
+
+    /// Whether any step changes or removes something already there — what
+    /// waits for the user's go-ahead before it's applied.
+    var changesExisting: Bool {
+        operations.contains { $0.op.lowercased() != "create" }
+    }
 }
 
 enum PlanParser {
@@ -134,14 +154,22 @@ enum PlanParser {
                          problem: "Claude's reply had no plan in it, so nothing was changed.")
         }
 
-        let json = String(text[bodyRange])
-        let plan = try? JSONDecoder().decode(ClaudePlan.self, from: Data(json.utf8))
-
         var prose = text
         for match in matches.reversed() {
             if let whole = Range(match.range, in: prose) { prose.removeSubrange(whole) }
         }
-        return Reply(plan: plan, prose: prose.trimmingCharacters(in: .whitespacesAndNewlines),
+        prose = prose.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Two plans are two answers — often the change and an alternative to
+        // it. Applying either would be a guess.
+        guard matches.count == 1 else {
+            return Reply(plan: nil, prose: prose,
+                         problem: "Claude's reply had more than one plan in it, so nothing was changed. Ask again, saying which you want.")
+        }
+
+        let json = String(text[bodyRange])
+        let plan = try? JSONDecoder().decode(ClaudePlan.self, from: Data(json.utf8))
+        return Reply(plan: plan, prose: prose,
                      problem: plan == nil
                          ? "Chroma couldn't read Claude's plan, so nothing was changed. Try asking again."
                          : nil)
@@ -151,11 +179,105 @@ enum PlanParser {
 /// Turns a plan into actual calendar changes.
 @MainActor
 enum PlanApplier {
+    /// One line of what happened, and whether it did.
+    struct Outcome: Hashable {
+        let text: String
+        let ok: Bool
+
+        static func done(_ text: String) -> Outcome { Outcome(text: text, ok: true) }
+        static func failed(_ text: String) -> Outcome { Outcome(text: text, ok: false) }
+    }
+
+    // MARK: - Before applying
+
+    /// Why the plan can't be applied, or nil when every step can.
+    ///
+    /// Checked in full before anything is touched. A move can arrive as a
+    /// delete and a create, and finding out the create's time is unreadable
+    /// once the delete has gone through would lose the event.
+    static func problem(in plan: ClaudePlan, snapshot: [EventItem], store: EventStore) -> String? {
+        for (index, operation) in plan.operations.enumerated() {
+            if let problem = problem(in: operation, snapshot: snapshot, store: store) {
+                let step = plan.operations.count > 1 ? "step \(index + 1) of Claude's plan" : "Claude's plan"
+                return "Nothing was changed: \(step) \(problem)."
+            }
+        }
+        return nil
+    }
+
+    private static func problem(in operation: ClaudeOperation, snapshot: [EventItem],
+                                store: EventStore) -> String? {
+        if let recurrence = operation.recurrence, let problem = recurrence.problem(parsingDate: date) {
+            return problem
+        }
+        if let start = operation.start, date(start) == nil { return "has a start Chroma can't read (\(start))" }
+        if let end = operation.end, date(end) == nil { return "has an end Chroma can't read (\(end))" }
+        switch operation.op.lowercased() {
+        case "create":
+            guard let title = operation.title, !title.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return "adds an event with no title"
+            }
+            return operation.start == nil ? "adds \(title) with no start time" : nil
+        case "update", "delete":
+            guard let item = resolve(operation.ref, in: snapshot) else {
+                return "refers to an event that isn't in the list"
+            }
+            // Named dates that can't be read never fall back to the whole
+            // series: "cancel the 9th" mustn't become "cancel them all".
+            if let days = operation.occurrences {
+                guard !days.isEmpty else { return "names no dates for \(item.title)" }
+                if let bad = days.first(where: { date($0) == nil }) {
+                    return "names a date Chroma can't read (\(bad))"
+                }
+            }
+            guard isOnMain(item, store: store) else {
+                return "would change \(item.title) on \u{201C}\(item.calendarTitle)\u{201D}, which Claude can't change"
+            }
+            return nil
+        default:
+            return "is a kind of change Chroma doesn't know (\u{201C}\(operation.op)\u{201D})"
+        }
+    }
+
+    /// Each step in words, for the user to look over before a plan that
+    /// changes or removes events is applied.
+    static func preview(_ plan: ClaudePlan, snapshot: [EventItem]) -> [String] {
+        plan.operations.map { operation in
+            let item = resolve(operation.ref, in: snapshot)
+            let name = "\u{201C}\(item?.title ?? operation.title ?? "")\u{201D}"
+            let days = operation.occurrences?.compactMap(date).map(shortDay).joined(separator: ", ")
+            let fromHere = item.map { $0.isRecurring ? " from \(shortDay($0.start)) on" : "" } ?? ""
+            switch operation.op.lowercased() {
+            case "create":
+                let start = date(operation.start).map { when($0, operation.allDay ?? false) } ?? ""
+                return "Add \(name) — \(start)\(repeats(operation.recurrence?.rule(parsingDate: date)))"
+            case "delete":
+                if let days { return "Remove \(name) on \(days)" }
+                if let item, !item.isRecurring { return "Remove \(name), \(when(item.start, item.isAllDay))" }
+                return "Remove \(name)\(fromHere)"
+            default:
+                var changes: [String] = []
+                if let title = operation.title, title != item?.title { changes.append("rename to \u{201C}\(title)\u{201D}") }
+                if let start = date(operation.start) {
+                    changes.append("move to \(when(start, operation.allDay ?? item?.isAllDay ?? false))")
+                }
+                if operation.location != nil { changes.append("new place") }
+                if operation.notes != nil { changes.append("new notes") }
+                if operation.recurrence != nil { changes.append("new repeat") }
+                if operation.category != nil { changes.append("new category") }
+                let scope = days.map { " on \($0)" } ?? fromHere
+                return "Change \(name)\(scope)" + (changes.isEmpty ? "" : " — " + changes.joined(separator: ", "))
+            }
+        }
+    }
+
+    // MARK: - Applying
+
     /// `snapshot` is the same list, in the same order, that the prompt showed —
     /// so a `ref` of 3 means the same event on both sides.
     static func apply(_ plan: ClaudePlan, snapshot: [EventItem],
-                      store: EventStore, colors: EventColors) async -> [String] {
-        var report: [String] = []
+                      store: EventStore, colors: EventColors) async -> [Outcome] {
+        var report: [Outcome] = []
 
         // In order, each finished before the next: a move can arrive as a
         // delete and a create, and a later step can depend on an earlier one.
@@ -168,19 +290,19 @@ enum PlanApplier {
             case "delete":
                 report.append(await delete(operation, snapshot: snapshot, store: store, colors: colors))
             default:
-                report.append("Ignored an unknown operation \"\(operation.op)\".")
+                report.append(.failed("Ignored an unknown operation \"\(operation.op)\"."))
             }
         }
         return report
     }
 
     private static func create(_ operation: ClaudeOperation,
-                               store: EventStore, colors: EventColors) async -> String {
+                               store: EventStore, colors: EventColors) async -> Outcome {
         guard let title = operation.title, !title.isEmpty else {
-            return "Skipped a new event with no title."
+            return .failed("Skipped a new event with no title.")
         }
         guard let start = date(operation.start) else {
-            return "Skipped \"\(title)\": couldn't read its start time."
+            return .failed("Skipped \"\(title)\": couldn't read its start time.")
         }
         let allDay = operation.allDay ?? false
         // An all-day end is its last day, so a one-day event ends on the day
@@ -196,30 +318,51 @@ enum PlanApplier {
                                                   recurrence: rule)
             if let seriesID, let category = category(operation.category) {
                 colors.set(EventColor.named(category.pigmentID), for: seriesID)
-                return "Added \(title) — \(when(start, allDay))\(repeats(rule)), \(category.name.lowercased())."
+                return .done("Added \(title) — \(when(start, allDay))\(repeats(rule)), \(category.name.lowercased()).")
             }
-            return "Added \(title) — \(when(start, allDay))\(repeats(rule))."
+            return .done("Added \(title) — \(when(start, allDay))\(repeats(rule)).")
         } catch {
-            return "Couldn't add \(title): \(error.localizedDescription)"
+            return .failed("Couldn't add \(title): \(error.localizedDescription)")
         }
     }
 
     private static func update(_ operation: ClaudeOperation, snapshot: [EventItem],
-                               store: EventStore, colors: EventColors) async -> String {
+                               store: EventStore, colors: EventColors) async -> Outcome {
         guard let shown = resolve(operation.ref, in: snapshot) else {
-            return "Couldn't find the event to change."
+            return .failed("Couldn't find the event to change.")
         }
-        guard isOnMain(shown, store: store) else { return leftAlone(shown) }
+        guard isOnMain(shown, store: store) else { return .failed(leftAlone(shown)) }
 
         // Named dates edit those occurrences and nothing else. If none of them
         // turns up, the answer is to stop, not to change the whole series.
-        if let days = operation.occurrences?.compactMap(date), !days.isEmpty {
+        if let named = operation.occurrences {
+            let days = named.compactMap(date)
+            guard !days.isEmpty, days.count == named.count else {
+                return .failed("Left \(shown.title) alone — couldn't read the dates to change.")
+            }
+            // Moving later, the latest date goes first, and moving earlier the
+            // earliest, so nothing lands on a date still to be looked up —
+            // "push the 9th and 10th back a day" mustn't move the 9th twice.
+            var order = days
+            if let target = date(operation.start) {
+                let calendar = store.calendar
+                let shift = calendar.dateComponents([.day], from: calendar.startOfDay(for: days[0]),
+                                                    to: calendar.startOfDay(for: target)).day ?? 0
+                order = shift > 0 ? days.sorted(by: >) : days.sorted()
+            }
             var changed: [Date] = []
             var problems: [String] = []
             // One at a time, looked up fresh: saving one occurrence leaves
             // the series' other fetched occurrences out of date.
-            for day in days {
-                guard let occurrence = await store.occurrence(of: shown, on: day) else {
+            for day in order {
+                let occurrence: EventItem?
+                do {
+                    occurrence = try await store.occurrence(of: shown, on: day)
+                } catch {
+                    problems.append("\(shortDay(day)): \(error.localizedDescription)")
+                    continue
+                }
+                guard let occurrence else {
                     problems.append("not on \(shortDay(day))")
                     continue
                 }
@@ -233,25 +376,32 @@ enum PlanApplier {
             }
             let title = operation.title ?? shown.title
             guard !changed.isEmpty else {
-                return "Left \(shown.title) alone — \(problems.joined(separator: "; "))."
+                return .failed("Left \(shown.title) alone — \(problems.joined(separator: "; ")).")
             }
             let tail = problems.isEmpty ? "" : " (\(problems.joined(separator: "; ")))"
-            return "Changed \(title) on \(changed.map(shortDay).joined(separator: ", "))\(tail)."
+            let line = "Changed \(title) on \(changed.sorted().map(shortDay).joined(separator: ", "))\(tail)."
+            return problems.isEmpty ? .done(line) : .failed(line)
         }
 
         // The whole series, from the occurrence the snapshot showed onwards.
         // Read again first: Claude worked from a copy that's a minute or so
         // old, and anything it didn't mention should keep its current value,
         // not the one in that copy.
-        guard let current = await store.current(shown) else {
-            return "Couldn't change \(shown.title) — it was removed in the meantime."
+        let current: EventItem?
+        do {
+            current = try await store.current(shown)
+        } catch {
+            return .failed("Couldn't change \(shown.title): \(error.localizedDescription)")
+        }
+        guard let current else {
+            return .failed("Couldn't change \(shown.title) — it was removed in the meantime.")
         }
         do {
             let (start, allDay) = try await save(operation, to: current, movedFrom: shown.start, span: nil,
                                                  store: store, colors: colors)
-            return "Changed \(operation.title ?? current.title) — now \(when(start, allDay))."
+            return .done("Changed \(operation.title ?? current.title) — now \(when(start, allDay)).")
         } catch {
-            return "Couldn't change \(current.title): \(error.localizedDescription)"
+            return .failed("Couldn't change \(current.title): \(error.localizedDescription)")
         }
     }
 
@@ -287,23 +437,27 @@ enum PlanApplier {
     }
 
     private static func delete(_ operation: ClaudeOperation, snapshot: [EventItem],
-                               store: EventStore, colors: EventColors) async -> String {
+                               store: EventStore, colors: EventColors) async -> Outcome {
         guard let item = resolve(operation.ref, in: snapshot) else {
-            return "Couldn't find the event to remove."
+            return .failed("Couldn't find the event to remove.")
         }
-        guard isOnMain(item, store: store) else { return leftAlone(item) }
+        guard isOnMain(item, store: store) else { return .failed(leftAlone(item)) }
 
         // Named dates mean single occurrences; resolved one at a time, because
         // each removal leaves the rest of the series' fetched copies stale.
-        if let dates = operation.occurrences?.compactMap(date), !dates.isEmpty {
+        if let named = operation.occurrences {
+            let dates = named.compactMap(date)
+            guard !dates.isEmpty, dates.count == named.count else {
+                return .failed("Left \(item.title) alone — couldn't read the dates to remove.")
+            }
             var removed: [Date] = []
             var missed = 0
             for day in dates {
-                guard let occurrence = await store.occurrence(of: item, on: day) else {
-                    missed += 1
-                    continue
-                }
                 do {
+                    guard let occurrence = try await store.occurrence(of: item, on: day) else {
+                        missed += 1
+                        continue
+                    }
                     try await store.delete(occurrence, span: .thisEvent)
                     removed.append(day)
                 } catch {
@@ -311,28 +465,36 @@ enum PlanApplier {
                 }
             }
             guard !removed.isEmpty else {
-                return "Couldn't remove any occurrence of \(item.title)."
+                return .failed("Couldn't remove any occurrence of \(item.title).")
             }
             let list = removed.map(shortDay).joined(separator: ", ")
-            let tail = missed > 0 ? " (\(missed) not found)" : ""
-            return "Removed \(item.title) on \(list)\(tail)."
+            let line = "Removed \(item.title) on \(list)\(missed > 0 ? " (\(missed) not found)" : "")."
+            return missed > 0 ? .failed(line) : .done(line)
         }
 
-        guard let current = await store.current(item) else {
-            return "\(item.title) was already gone."
+        let current: EventItem?
+        do {
+            current = try await store.current(item)
+        } catch {
+            return .failed("Couldn't remove \(item.title): \(error.localizedDescription)")
+        }
+        guard let current else {
+            return .done("\(item.title) was already gone.")
         }
         do {
             // A series goes from the occurrence shown onwards; earlier ones
             // stay, as a record of what happened.
             try await store.delete(current)
             if !(await store.seriesExists(current)) { colors.set(nil, for: current.seriesID) }
-            return current.isRecurring
+            return .done(current.isRecurring
                 ? "Removed \(current.title) from \(shortDay(current.start)) on."
-                : "Removed \(current.title)."
+                : "Removed \(current.title).")
         } catch {
-            return "Couldn't remove \(current.title): \(error.localizedDescription)"
+            return .failed("Couldn't remove \(current.title): \(error.localizedDescription)")
         }
     }
+
+    // MARK: - Pieces
 
     /// `date` moved the way `base` moved to `target`: the same number of days
     /// along, at `target`'s time of day.
@@ -368,12 +530,16 @@ enum PlanApplier {
     }
 
     /// Accepts "2026-09-08T17:00" and the all-day "2026-09-08". Local time, and
-    /// a fixed locale so parsing never drifts with the user's region settings.
+    /// a fixed locale and calendar so parsing never drifts with the user's
+    /// region settings. The calendar has to be set for the bare date to read
+    /// on a day whose midnight a clock change skips, as in Chile or Lebanon.
     private static func date(_ text: String?) -> Date? {
         guard let text, !text.isEmpty else { return nil }
         for format in ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = .autoupdatingCurrent
             formatter.dateFormat = format
             if let parsed = formatter.date(from: text) { return parsed }
         }

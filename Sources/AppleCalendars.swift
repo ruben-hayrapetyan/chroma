@@ -114,7 +114,7 @@ final class AppleCalendars: CalendarProvider {
     /// EventKit hands back a distinct `EKEvent` per occurrence, and holding
     /// the right one is what makes a `.thisEvent` edit affect a single date
     /// instead of the whole series.
-    func occurrence(of item: EventItem, on day: Date) async -> EventItem? {
+    func occurrence(of item: EventItem, on day: Date) async throws -> EventItem? {
         let calendar = Calendar.autoupdatingCurrent
         let from = calendar.startOfDay(for: day)
         guard let to = calendar.date(byAdding: .day, value: 1, to: from),
@@ -127,11 +127,11 @@ final class AppleCalendars: CalendarProvider {
 
     /// Falls back to looking the occurrence up again, for when an earlier step
     /// left the fetched copy unusable.
-    func current(_ item: EventItem) async -> EventItem? {
+    func current(_ item: EventItem) async throws -> EventItem? {
         if case .apple(let event) = item.origin, event.refresh() {
             return EventItem(event)
         }
-        return await occurrence(of: item, on: item.start)
+        return try await occurrence(of: item, on: item.start)
     }
 }
 

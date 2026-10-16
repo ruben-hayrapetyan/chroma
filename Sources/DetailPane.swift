@@ -13,6 +13,9 @@ struct DetailPane: View {
     let item: EventItem
     @Binding var isEditing: Bool
     let onClose: () -> Void
+    /// The saved occurrence's id, which a time change or a series split
+    /// changes, so the pane can follow it.
+    let onSaved: (String) -> Void
 
     @State private var title = ""
     @State private var start = Date()
@@ -63,7 +66,9 @@ struct DetailPane: View {
             if editing { seed(); titleFocused = true } else { error = nil }
         }
         .onChange(of: start) { old, new in
-            guard isEditing, end <= new else { return }
+            // Seeding sets the start too; an event's own times, zero-length
+            // deadlines included, are left as they are.
+            guard isEditing, end <= new, !(new == item.start && end == item.end) else { return }
             end = new.addingTimeInterval(max(end.timeIntervalSince(old), 3600))
         }
         .confirmationDialog("Delete \"\(item.title)\"?", isPresented: $confirmingDelete) {
@@ -302,6 +307,7 @@ struct DetailPane: View {
         let cleaned = title.trimmingCharacters(in: .whitespaces)
         guard !cleaned.isEmpty, !working else { return }
         let item = item
+        let newStart = start
         working = true
         Task {
             defer { working = false }
@@ -310,6 +316,7 @@ struct DetailPane: View {
                                                      isAllDay: isAllDay, location: location, notes: notes,
                                                      recurrence: recurrence == seededRecurrence ? .unchanged : recurrence.edit)
                 colors.carry(from: item.seriesID, to: savedID)
+                onSaved(EventItem.id(series: savedID ?? item.seriesID, start: newStart))
                 isEditing = false
             } catch {
                 self.error = error.localizedDescription

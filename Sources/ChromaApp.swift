@@ -22,6 +22,9 @@ final class Intents: ObservableObject {
 
 /// An event that does not exist yet.
 struct DraftEvent: Equatable {
+    /// Which draft this is, so a create that finishes late closes its own
+    /// draft and not one begun since.
+    var id = UUID()
     var start: Date
     var end: Date
     var title: String = ""

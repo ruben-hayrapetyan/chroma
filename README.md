@@ -311,9 +311,16 @@ plan:
   "recurrence":{"freq":"weekly","interval":1,"byDay":["TU"],"until":"2026-12-19"}}]}
 ```
 
-Chroma applies that itself, to Apple Calendar or Google, and lists what changed. If the reply has
-no plan, or one Chroma can't read, nothing is applied and the panel says so:
-Claude's sentence alone doesn't mean anything changed. A request you stop, or
+Chroma checks the whole plan before touching anything: if any step can't be
+read — a date in the wrong form, a repeat with an end date that doesn't parse,
+an event that isn't in the list — nothing is applied and the panel says which
+step and why. A plan that only adds events is applied at once. One that changes
+or removes anything is listed first, step by step, and nothing happens until you
+press **Apply Changes** (`⌘↩`) — titles come from invitations anyone can send,
+so nothing already on your calendar moves without you seeing it. Chroma then
+lists what changed, marking anything that didn't. If the reply has no plan, or
+more than one, nothing is applied and the panel says so: Claude's sentence alone
+doesn't mean anything changed. A request you stop, or
 one still running after three minutes, is stopped without applying anything.
 `update` and `delete` refer to events by their number in the snapshot. Events from other
 calendars are marked read-only in it; a plan that tries to change one is

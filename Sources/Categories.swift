@@ -211,9 +211,11 @@ enum Categories {
     ///
     /// The exceptions are checked by asking the categoriser, not by matching
     /// the title — so renaming a session that matters can't accidentally hide it.
+    /// It's the rules' answer that counts, not a calendar's own colour: a
+    /// professor's office hours on a coloured course calendar are still theirs.
     static func isFilteredOut(_ item: EventItem) -> Bool {
         guard let filter = RuleBook.shared.rules.filter else { return false }
-        if let except = filter.except, let slug = category(for: item)?.slug,
+        if let except = filter.except, let slug = ruleCategory(for: item)?.slug,
            except.contains(slug) { return false }
         return item.title.range(of: filter.pattern,
                                 options: [.regularExpression, .caseInsensitive]) != nil
@@ -286,6 +288,12 @@ enum Categories {
             return EventCategory(name: item.calendarTitle, slug: "calendar",
                                  pigmentID: pigment, pattern: "")
         }
+        return ruleCategory(for: item)
+    }
+
+    /// The category from the event itself — its marker, then its title —
+    /// whatever its calendar is coloured.
+    static func ruleCategory(for item: EventItem) -> EventCategory? {
         if let marker = item.notes.range(of: #"\[chroma:\s*[a-z-]+\]"#,
                                          options: [.regularExpression, .caseInsensitive]) {
             let slug = item.notes[marker]

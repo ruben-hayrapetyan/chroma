@@ -180,6 +180,9 @@ struct NewEventPane: View {
         creating = true
         Task {
             defer { creating = false }
+            // Another slot double-clicked while this was on its way is a new
+            // draft, and this one finishing mustn't close it.
+            let stillOpen = { draft?.id == value.id }
             do {
                 let seriesID = try await store.create(title: title,
                                                       start: value.start,
@@ -191,9 +194,9 @@ struct NewEventPane: View {
                 if let seriesID, let colorID = value.colorID {
                     colors.set(EventColor.named(colorID), for: seriesID)
                 }
-                onClose()
+                if stillOpen() { onClose() }
             } catch {
-                self.error = error.localizedDescription
+                if stillOpen() { self.error = error.localizedDescription }
             }
         }
     }

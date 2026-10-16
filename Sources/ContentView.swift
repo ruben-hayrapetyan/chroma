@@ -20,12 +20,19 @@ struct ContentView: View {
     /// and quietly clears itself if the event is deleted elsewhere.
     @State private var selectedID: String?
 
+    /// Changes whenever a different event is opened, which gives the inspector
+    /// a fresh start. Without it, double-clicking another event mid-edit kept
+    /// the first one's title and times in the form, and Save wrote them onto
+    /// the second. A save or delete still running from before checks this too,
+    /// so it can't close or change the pane that replaced its own.
+    @State private var paneToken = UUID()
+
     private var selectedItem: EventItem? {
         guard let selectedID else { return nil }
         if let exact = store.items.first(where: { $0.id == selectedID }) { return exact }
-        // The id encodes the occurrence's start time, so saving a new time
-        // changes it. Fall back to the series so the pane survives its own edit.
-        let series = String(selectedID.prefix { $0 != "@" })
+        // The id encodes the occurrence's start time, so an edit arriving from
+        // elsewhere changes it. Fall back to the series so the pane survives.
+        let series = EventItem.series(of: selectedID)
         return store.items.first { $0.seriesID == series }
     }
 
@@ -160,24 +167,28 @@ struct ContentView: View {
                         .padding(.bottom, 14)
                 }
 
+                // Wide, the inspector has a column of its own: this keeps the
+                // room, and the pane sits over it from the overlay below. The
+                // pane is drawn in that one place at every width, so crossing
+                // the threshold doesn't rebuild it — an open edit, or a save
+                // under way, carries on as it was.
                 if !overlays, hasPane {
                     Divider().foregroundStyle(Theme.rule)
-                    rightPane
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                    Color.clear.frame(width: 320)       // the panes' width
                 }
             }
             .overlay(alignment: .trailing) {
-                if overlays, hasPane {
+                if hasPane {
                     rightPane
-                        .clipShape(RoundedRectangle(cornerRadius: Theme.cardRadius,
+                        .clipShape(RoundedRectangle(cornerRadius: overlays ? Theme.cardRadius : 0,
                                                     style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
-                                .strokeBorder(Theme.rule, lineWidth: 0.5)
+                                .strokeBorder(Theme.rule, lineWidth: overlays ? 0.5 : 0)
                         )
-                        .shadow(color: Theme.lift, radius: Theme.liftRadius, x: -3, y: 2)
-                        .padding(.vertical, 10)
-                        .padding(.trailing, 10)
+                        .shadow(color: overlays ? Theme.lift : .clear, radius: Theme.liftRadius, x: -3, y: 2)
+                        .padding(.vertical, overlays ? 10 : 0)
+                        .padding(.trailing, overlays ? 10 : 0)
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
@@ -193,12 +204,23 @@ struct ContentView: View {
         if intents.draft != nil {
             NewEventPane(draft: $intents.draft, onClose: closeDraft)
         } else if let item = selectedItem {
+            let token = paneToken
             DetailPane(item: item,
-                       isEditing: $editingSelection,
-                       onClose: { withAnimation(.snappy(duration: 0.2)) {
-                           selectedID = nil
-                           editingSelection = false
-                       } })
+                       isEditing: Binding(get: { editingSelection },
+                                          set: { if paneToken == token { editingSelection = $0 } }),
+                       onClose: {
+                           guard paneToken == token else { return }
+                           withAnimation(.snappy(duration: 0.2)) {
+                               selectedID = nil
+                               editingSelection = false
+                           }
+                       },
+                       onSaved: { id in
+                           // A series split from partway comes back under a new
+                           // id; the pane follows the occurrence it just saved.
+                           if paneToken == token { selectedID = id }
+                       })
+                .id(token)
         }
     }
 
@@ -207,6 +229,7 @@ struct ContentView: View {
     private func select(_ item: EventItem) {
         withAnimation(.snappy(duration: 0.2)) {
             intents.draft = nil
+            if selectedID != item.id { paneToken = UUID() }
             selectedID = item.id
             editingSelection = false
         }
@@ -217,6 +240,7 @@ struct ContentView: View {
     private func edit(_ item: EventItem) {
         withAnimation(.snappy(duration: 0.2)) {
             intents.draft = nil
+            if selectedID != item.id { paneToken = UUID() }
             selectedID = item.id
             editingSelection = item.isEditable
         }

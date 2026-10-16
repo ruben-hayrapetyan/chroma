@@ -14,10 +14,19 @@ struct PositionedEvent: Identifiable {
 }
 
 enum EventLayout {
+    /// The shortest an event is drawn, in minutes — and so the shortest it's
+    /// packed as. Packing by the real end let a ten-minute standup share a
+    /// column with the meeting after it, and drew one over the other.
+    static let shortestMinutes = 18.0
+
+    private static func end(of item: EventItem) -> Date {
+        max(item.end, item.start.addingTimeInterval(shortestMinutes * 60))
+    }
+
     /// Assign columns to a single day's timed events.
     static func position(_ items: [EventItem]) -> [PositionedEvent] {
         let sorted = items.sorted { lhs, rhs in
-            lhs.start == rhs.start ? lhs.end > rhs.end : lhs.start < rhs.start
+            lhs.start == rhs.start ? end(of: lhs) > end(of: rhs) : lhs.start < rhs.start
         }
 
         var result: [PositionedEvent] = []
@@ -33,7 +42,7 @@ enum EventLayout {
                 clusterEnd = .distantPast
             }
             cluster.append(item)
-            clusterEnd = max(clusterEnd, item.end)
+            clusterEnd = max(clusterEnd, end(of: item))
         }
         result += assignColumns(cluster)
         return result
@@ -48,10 +57,10 @@ enum EventLayout {
 
         for item in cluster {
             if let free = columnEnds.firstIndex(where: { $0 <= item.start }) {
-                columnEnds[free] = item.end
+                columnEnds[free] = end(of: item)
                 placements.append((item, free))
             } else {
-                columnEnds.append(item.end)
+                columnEnds.append(end(of: item))
                 placements.append((item, columnEnds.count - 1))
             }
         }
