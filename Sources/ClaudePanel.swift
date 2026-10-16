@@ -5,10 +5,10 @@ import SwiftUI
 /// Runs the Claude CLI in print mode and streams its output back.
 ///
 /// Claude gets **no tools at all**. It reads a snapshot of the calendar handed to
-/// it in the prompt and replies with a plan; Chroma applies that plan through
-/// EventKit. Driving Calendar.app over AppleScript was what used to launch it
-/// and leave it sitting in the Dock, and it made every date locale-dependent —
-/// both problems disappear along with the tool access.
+/// it in the prompt and replies with a plan; Chroma applies that plan itself,
+/// to Apple Calendar or Google. Driving Calendar.app over AppleScript was what
+/// used to launch it and leave it sitting in the Dock, and it made every date
+/// locale-dependent — both problems disappear along with the tool access.
 @MainActor
 final class ClaudeRunner: ObservableObject {
     @Published private(set) var isRunning = false
@@ -209,7 +209,7 @@ final class ClaudeRunner: ObservableObject {
         calendar named "\(calendarName)".
 
         You have NO tools. Do not try to run commands or read files. You act by \
-        returning a plan, which the app applies for you through EventKit.
+        returning a plan, which the app applies for you.
 
         Today is \(formatter.string(from: Date())). The user is looking at \
         \(formatter.string(from: day)). Resolve anything relative — "tomorrow", \
@@ -283,6 +283,8 @@ struct ClaudePanel: View {
     @State private var lastRequest = ""
     @State private var snapshot: [EventItem] = []
     @State private var applied: [String] = []
+    /// The plan going into the calendar, one change at a time.
+    @State private var applying = false
     /// Why a finished reply changed nothing, when Claude's own sentence
     /// might say otherwise.
     @State private var problem: String?
@@ -322,7 +324,7 @@ struct ClaudePanel: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 20)
                     .padding(.top, 12)
-            } else if !runner.transcript.isEmpty || runner.isRunning
+            } else if !runner.transcript.isEmpty || runner.isRunning || applying
                 || runner.failure != nil || problem != nil || !applied.isEmpty {
                 transcriptArea
             }
@@ -340,7 +342,8 @@ struct ClaudePanel: View {
         }
         .onDisappear {
             // Closed mid-request: stop it rather than leave it running with
-            // nowhere to apply its plan.
+            // nowhere to apply its plan. A plan already being applied carries
+            // on to the end, rather than stopping half-made.
             runner.cancel()
             store.reload()
         }
@@ -410,9 +413,9 @@ struct ClaudePanel: View {
 
     private var footer: some View {
         HStack(spacing: 10) {
-            if runner.isRunning {
+            if runner.isRunning || applying {
                 ProgressView().controlSize(.small)
-                Text("Claude is working…")
+                Text(applying ? "Making the changes…" : "Claude is working…")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.graphite)
             } else {
@@ -443,7 +446,7 @@ struct ClaudePanel: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                 .help("Send to Claude (⌘↩)")
-                .disabled(runner.isRunning || ClaudeRunner.executable == nil
+                .disabled(runner.isRunning || applying || ClaudeRunner.executable == nil
                           || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(16)
@@ -473,7 +476,11 @@ struct ClaudePanel: View {
             problem = reply.problem
             return
         }
-        applied = PlanApplier.apply(plan, snapshot: snapshot, store: store, colors: colors)
+        applying = true
+        Task {
+            applied = await PlanApplier.apply(plan, snapshot: snapshot, store: store, colors: colors)
+            applying = false
+        }
     }
 
     /// The most lines a snapshot carries. Past this the prompt gets slow and
@@ -539,7 +546,7 @@ struct ClaudePanel: View {
         let clock = DateFormatter()
         clock.locale = Locale(identifier: "en_US_POSIX")
         clock.dateFormat = "HH:mm"
-        let mainID = store.targetCalendar?.calendarIdentifier
+        let mainID = store.targetCalendar?.id
 
         return items.enumerated().map { index, item in
             let when = item.isAllDay

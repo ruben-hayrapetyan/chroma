@@ -13,10 +13,10 @@ struct CalendarRef: Codable, Equatable {
     var title: String
     var account: String
 
-    init(_ calendar: EKCalendar) {
-        id = calendar.calendarIdentifier
+    init(_ calendar: CalendarInfo) {
+        id = calendar.id
         title = calendar.title
-        account = calendar.source?.title ?? ""
+        account = calendar.account
     }
 }
 
@@ -57,16 +57,22 @@ struct ExtraCalendar: Codable, Equatable, Identifiable {
 struct CalendarGroup: Identifiable {
     let id: String
     let account: String
-    let calendars: [EKCalendar]
+    let calendars: [CalendarInfo]
 }
 
 /// One occurrence of an event, flattened for display.
 ///
-/// EventKit hands back a fresh `EKEvent` per occurrence of a repeating event,
-/// all sharing one `eventIdentifier`. SwiftUI needs per-row identity, so `id`
-/// pins the occurrence while `seriesID` stays stable across the series — which
-/// is what per-event colour is keyed on.
+/// A repeating event comes back once per occurrence, every one sharing the
+/// series' identifier. SwiftUI needs per-row identity, so `id` pins the
+/// occurrence while `seriesID` stays stable across the series — which is what
+/// per-event colour is keyed on.
 struct EventItem: Identifiable {
+    /// The event as its source holds it, for changing it later.
+    enum Origin {
+        case apple(EKEvent)
+        case google(GoogleEventRef)
+    }
+
     let id: String
     let seriesID: String
     let title: String
@@ -79,28 +85,36 @@ struct EventItem: Identifiable {
     let calendarID: String
     let calendarTitle: String
     /// The pigment its calendar was given in Settings, if any.
-    let calendarColorID: String?
+    var calendarColorID: String?
     /// False for subscriptions, holiday calendars, and anything shared
     /// read-only.
     let isEditable: Bool
-    let ekEvent: EKEvent
+    let origin: Origin
 
-    init(_ event: EKEvent, calendarColorID: String? = nil) {
-        let series = event.eventIdentifier ?? UUID().uuidString
-        self.seriesID = series
-        self.id = series + "@" + String(event.startDate.timeIntervalSinceReferenceDate)
-        self.title = (event.title?.isEmpty == false) ? event.title! : "(no title)"
-        self.start = event.startDate
-        self.end = event.endDate
-        self.isAllDay = event.isAllDay
-        self.location = event.location ?? ""
-        self.notes = event.notes ?? ""
-        self.isRecurring = event.hasRecurrenceRules
-        self.calendarID = event.calendar?.calendarIdentifier ?? ""
-        self.calendarTitle = event.calendar?.title ?? ""
-        self.calendarColorID = calendarColorID
-        self.isEditable = event.calendar?.allowsContentModifications ?? false
-        self.ekEvent = event
+    init(seriesID: String, title: String, start: Date, end: Date, isAllDay: Bool,
+         location: String, notes: String, isRecurring: Bool, calendarID: String,
+         calendarTitle: String, isEditable: Bool, origin: Origin) {
+        self.seriesID = seriesID
+        self.id = seriesID + "@" + String(start.timeIntervalSinceReferenceDate)
+        self.title = title.isEmpty ? "(no title)" : title
+        self.start = start
+        self.end = end
+        self.isAllDay = isAllDay
+        self.location = location
+        self.notes = notes
+        self.isRecurring = isRecurring
+        self.calendarID = calendarID
+        self.calendarTitle = calendarTitle
+        self.isEditable = isEditable
+        self.origin = origin
+    }
+
+    /// The series' repeat rules, nil when it doesn't repeat.
+    var recurrenceRules: [EKRecurrenceRule]? {
+        switch origin {
+        case .apple(let event): return event.recurrenceRules
+        case .google(let ref): return ref.rules
+        }
     }
 
     /// Where the block sits in one day's column, in minutes from midnight:
@@ -129,12 +143,12 @@ struct EventItem: Identifiable {
     }
 }
 
-/// Owns the EventKit connection and republishes what the current view needs.
+/// Owns the connection to the calendars and republishes what the current view
+/// needs.
 ///
-/// There is no syncing here in any real sense. The app talks to the same
-/// EventKit database Calendar.app does, so an edit made anywhere — this app,
-/// Calendar.app, or arriving from iCloud or Google — is the same object. All
-/// this class does is notice and reload.
+/// The calendars come from one source at a time — Apple Calendar or Google
+/// Calendar, chosen on first launch and switchable in Settings. Everything
+/// here works the same for either; the source sits behind `CalendarProvider`.
 ///
 /// It works on one main calendar, picked on first launch: new events go there,
 /// and it is the only one Claude may change. Other calendars can be connected
@@ -144,9 +158,16 @@ final class EventStore: ObservableObject {
     enum Access: Equatable {
         case pending
         case granted
+        /// macOS refused access to its calendars.
         case denied(String)
+        /// Google, with no account signed in.
+        case signedOut
+        /// Google, signed in but out of reach.
+        case unreachable(String)
     }
 
+    /// Nil until the first-launch choice.
+    @Published private(set) var source: CalendarSource?
     @Published private(set) var access: Access = .pending
     @Published private(set) var items: [EventItem] = []
 
@@ -162,14 +183,25 @@ final class EventStore: ObservableObject {
     /// without anyone asking.
     @Published private(set) var revision = 0
 
-    /// The calendar new events go to. Nil until one is chosen.
-    @Published private(set) var mainCalendar: CalendarRef? = EventStore.loadDefault("mainCalendar") {
-        didSet { EventStore.saveDefault(mainCalendar, "mainCalendar") }
+    /// Bumped whenever the source reports a change, even before a main
+    /// calendar is chosen — what the first-launch picker watches.
+    @Published private(set) var sourceRevision = 0
+
+    /// A Google sign-in under way in the browser, and why the last one failed.
+    @Published private(set) var signingIn = false
+    @Published var signInProblem: String?
+    /// Why Google can't be reached at the moment, nil while all is well.
+    @Published private(set) var syncProblem: String?
+
+    /// The calendar new events go to. Nil until one is chosen. Each source
+    /// keeps its own, so switching back finds it as it was.
+    @Published private(set) var mainCalendar: CalendarRef? {
+        didSet { EventStore.saveDefault(mainCalendar, key("mainCalendar")) }
     }
 
     /// Calendars drawn alongside the main one, in the order they were connected.
-    @Published private(set) var extraCalendars: [ExtraCalendar] = EventStore.loadDefault("extraCalendars") ?? [] {
-        didSet { EventStore.saveDefault(extraCalendars, "extraCalendars") }
+    @Published private(set) var extraCalendars: [ExtraCalendar] {
+        didSet { EventStore.saveDefault(extraCalendars, key("extraCalendars")) }
     }
 
     /// Whether the events matched by the filter in `categories.json` are drawn.
@@ -199,7 +231,7 @@ final class EventStore: ObservableObject {
     /// Follows the system's time zone as it changes, rather than keeping the
     /// one the app launched in.
     let calendar = Calendar.autoupdatingCurrent
-    private let store = EKEventStore()
+    private var provider: CalendarProvider?
     private var observers: [NSObjectProtocol] = []
     private var rulesSubscription: AnyCancellable?
 
@@ -208,15 +240,12 @@ final class EventStore: ObservableObject {
     private var today = Calendar.current.startOfDay(for: Date())
 
     init() {
+        let source = Self.savedSource()
+        self.source = source
+        mainCalendar = Self.loadDefault(Self.key("mainCalendar", for: source))
+        extraCalendars = Self.loadDefault(Self.key("extraCalendars", for: source)) ?? []
+
         let center = NotificationCenter.default
-        observers.append(center.addObserver(
-            forName: .EKEventStoreChanged, object: store, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.corpusIsStale = true
-                self?.reload()
-            }
-        })
         // Midnight, a clock or time-zone change, and waking from a night's
         // sleep — the last of which doesn't always arrive as a day change.
         for name in [Notification.Name.NSCalendarDayChanged, .NSSystemTimeZoneDidChange,
@@ -232,7 +261,7 @@ final class EventStore: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.reload() }
-        requestAccess()
+        connectSource()
     }
 
     deinit {
@@ -252,34 +281,146 @@ final class EventStore: ObservableObject {
         }
     }
 
-    // MARK: - Access
+    // MARK: - Source
 
-    private func requestAccess() {
-        store.requestFullAccessToEvents { [weak self] granted, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if granted {
-                    self.access = .granted
-                    self.reload()
-                } else {
-                    self.access = .denied(error?.localizedDescription
-                        ?? "Calendar access was denied. Grant it in System Settings › Privacy & Security › Calendars, then reopen the app.")
-                }
+    /// A copy set up before there was a choice was using Apple Calendar, and
+    /// carries on with it rather than being asked again.
+    private static func savedSource() -> CalendarSource? {
+        if let raw = UserDefaults.standard.string(forKey: "calendarSource") {
+            return CalendarSource(rawValue: raw)
+        }
+        return UserDefaults.standard.data(forKey: "mainCalendar") != nil ? .apple : nil
+    }
+
+    /// Apple Calendar's settings keep the names they had before Google was an
+    /// option.
+    private static func key(_ name: String, for source: CalendarSource?) -> String {
+        source == .google ? "google." + name : name
+    }
+
+    private func key(_ name: String) -> String { Self.key(name, for: source) }
+
+    /// Switches where the calendars come from. Each source keeps its own main
+    /// calendar and connected calendars, so switching back loses nothing.
+    func use(_ source: CalendarSource) {
+        guard source != self.source || provider == nil else { return }
+        UserDefaults.standard.set(source.rawValue, forKey: "calendarSource")
+        self.source = source
+        mainCalendar = Self.loadDefault(key("mainCalendar"))
+        extraCalendars = Self.loadDefault(key("extraCalendars")) ?? []
+        connectSource()
+    }
+
+    private func connectSource() {
+        (provider as? GoogleCalendars)?.stopWatching()
+        provider = nil
+        items = []
+        itemsByDay = [:]
+        corpus = []
+        corpusIsStale = true
+        syncProblem = nil
+        signInProblem = nil
+        access = .pending
+        guard let source else { return }
+
+        let provider: CalendarProvider
+        switch source {
+        case .apple:
+            provider = AppleCalendars()
+        case .google:
+            let google = GoogleCalendars()
+            google.onSignedOut = { [weak self] in self?.access = .signedOut }
+            google.onProblem = { [weak self] in self?.syncProblem = $0 }
+            provider = google
+        }
+        provider.onChange = { [weak self] in
+            self?.sourceRevision += 1
+            self?.corpusIsStale = true
+            self?.reload()
+        }
+        self.provider = provider
+        Task { await requestAccess() }
+    }
+
+    private func requestAccess() async {
+        guard let provider else { return }
+        let result = await provider.requestAccess()
+        // Switched to the other source while asking.
+        guard provider === self.provider else { return }
+        access = result
+        corpusIsStale = true
+        reload()
+    }
+
+    /// Tries Google again after it couldn't be reached.
+    func retryAccess() {
+        access = .pending
+        Task { await requestAccess() }
+    }
+
+    // MARK: - Google
+
+    private var google: GoogleCalendars? { provider as? GoogleCalendars }
+
+    /// The signed-in Google account's address.
+    var googleAccount: String? { google?.account }
+
+    var hasGoogleClient: Bool { GoogleClient.load() != nil }
+
+    /// Opens Google in the browser and waits for it to send the browser back.
+    func signInToGoogle() {
+        guard let google, !signingIn else { return }
+        signingIn = true
+        signInProblem = nil
+        Task {
+            defer { signingIn = false }
+            do {
+                try await google.signIn()
+                guard google === self.google else { return }
+                access = .granted
+                corpusIsStale = true
+                reload()
+            } catch {
+                signInProblem = error.localizedDescription
             }
         }
+    }
+
+    func cancelGoogleSignIn() {
+        google?.auth.cancelSignIn()
+    }
+
+    func signOutOfGoogle() {
+        guard let google else { return }
+        Task {
+            await google.signOut()
+            guard google === self.google else { return }
+            access = .signedOut
+            items = []
+            itemsByDay = [:]
+            corpus = []
+            corpusIsStale = true
+        }
+    }
+
+    /// Keeps a Google Cloud client file where sign-in looks for it.
+    func installGoogleClient(from url: URL) throws {
+        try GoogleClient.install(from: url)
+        objectWillChange.send()
     }
 
     // MARK: - Calendars
 
     /// The calendar we create in, or nil if none is chosen or it has gone.
-    var targetCalendar: EKCalendar? { mainCalendar.flatMap(resolve) }
+    var targetCalendar: CalendarInfo? { mainCalendar.flatMap(resolve) }
 
-    /// What the sidebar calls the main calendar: its account, as macOS names
-    /// it — "iCloud", "Google", "Exchange". An account titled by its email
-    /// address is shortened to the service, since the address is precise and
-    /// useless as a label.
+    /// What the sidebar calls the main calendar's account — "iCloud",
+    /// "Google", "Exchange". An account titled by its email address is
+    /// shortened to the service, since the address is precise and useless as
+    /// a label.
     var accountLabel: String {
-        guard let title = targetCalendar?.source?.title else { return "" }
+        if source == .google { return "Google" }
+        guard let title = targetCalendar?.account, !title.isEmpty else { return "" }
         guard let at = title.firstIndex(of: "@") else { return title }
         let domain = title[title.index(after: at)...].lowercased()
         switch domain {
@@ -290,26 +431,24 @@ final class EventStore: ObservableObject {
         }
     }
 
-    /// The calendar EventKit would create in, used to preselect the first-launch
-    /// picker.
-    var systemDefaultCalendar: EKCalendar? { store.defaultCalendarForNewEvents }
+    /// The calendar the source would create in, used to preselect the
+    /// first-launch picker.
+    var defaultCalendarID: String? { provider?.defaultCalendarID }
 
-    func resolve(_ ref: CalendarRef) -> EKCalendar? {
-        if let exact = store.calendar(withIdentifier: ref.id) { return exact }
-        return store.calendars(for: .event).first {
-            $0.title == ref.title && ($0.source?.title ?? "") == ref.account
-        }
+    func resolve(_ ref: CalendarRef) -> CalendarInfo? {
+        let calendars = provider?.calendars() ?? []
+        return calendars.first { $0.id == ref.id }
+            ?? calendars.first { $0.title == ref.title && $0.account == ref.account }
     }
 
-    /// Every calendar on this Mac, grouped by account. Accounts are kept apart
-    /// by identifier, not title, since two Google accounts are both "Google".
+    /// Every calendar the source offers, grouped by account. Accounts are kept
+    /// apart by identifier, not title, since two Google accounts are both
+    /// "Google".
     func calendarGroups(writableOnly: Bool = false) -> [CalendarGroup] {
-        let calendars = store.calendars(for: .event)
-            .filter { !writableOnly || $0.allowsContentModifications }
-        let bySource = Dictionary(grouping: calendars) { $0.source?.sourceIdentifier ?? "" }
-        return bySource.map { id, members in
+        let calendars = (provider?.calendars() ?? []).filter { !writableOnly || $0.isWritable }
+        return Dictionary(grouping: calendars, by: \.accountID).map { id, members in
             CalendarGroup(id: id,
-                          account: members.first?.source?.title ?? "Other",
+                          account: members.first.map { $0.account.isEmpty ? "Other" : $0.account } ?? "Other",
                           calendars: members.sorted {
                               $0.title.localizedStandardCompare($1.title) == .orderedAscending
                           })
@@ -317,20 +456,19 @@ final class EventStore: ObservableObject {
         .sorted { $0.account.localizedStandardCompare($1.account) == .orderedAscending }
     }
 
-    func useAsMain(_ calendar: EKCalendar) {
+    func useAsMain(_ calendar: CalendarInfo) {
         mainCalendar = CalendarRef(calendar)
-        extraCalendars.removeAll { $0.id == calendar.calendarIdentifier }
+        extraCalendars.removeAll { $0.id == calendar.id }
         corpusIsStale = true
         reload()
     }
 
-    func isConnected(_ calendar: EKCalendar) -> Bool {
-        extraCalendars.contains { $0.id == calendar.calendarIdentifier }
+    func isConnected(_ calendar: CalendarInfo) -> Bool {
+        extraCalendars.contains { $0.id == calendar.id }
     }
 
-    func connect(_ calendar: EKCalendar) {
-        guard !isConnected(calendar),
-              calendar.calendarIdentifier != targetCalendar?.calendarIdentifier else { return }
+    func connect(_ calendar: CalendarInfo) {
+        guard !isConnected(calendar), calendar.id != targetCalendar?.id else { return }
         extraCalendars.append(ExtraCalendar(ref: CalendarRef(calendar)))
         corpusIsStale = true
         reload()
@@ -346,9 +484,9 @@ final class EventStore: ObservableObject {
         guard let index = extraCalendars.firstIndex(where: { $0.id == id }) else { return }
         extraCalendars[index].isShown = shown
         // A calendar newly shared on Google can be on the server before
-        // EventKit has asked for it; this nudges the accounts to sync.
+        // this Mac has asked for it; this nudges the accounts to sync.
         if shown, resolve(extraCalendars[index].ref) == nil {
-            store.refreshSourcesIfNecessary()
+            provider?.refreshSources()
         }
         corpusIsStale = true
         reload()
@@ -367,37 +505,40 @@ final class EventStore: ObservableObject {
     }
 
     /// Every calendar currently being drawn: the main one, plus each connected
-    /// calendar that is switched on and present on this Mac.
-    private func visibleCalendars(_ main: EKCalendar) -> [EKCalendar] {
+    /// calendar that is switched on and still there.
+    private func visibleCalendars(_ main: CalendarInfo) -> [CalendarInfo] {
         [main] + extraCalendars.filter(\.isShown).compactMap { resolve($0.ref) }
-            .filter { $0.calendarIdentifier != main.calendarIdentifier }
+            .filter { $0.id != main.id }
     }
 
-    private func makeItem(_ event: EKEvent) -> EventItem {
-        let id = event.calendar?.calendarIdentifier
-        return EventItem(event, calendarColorID: extraCalendars.first { $0.id == id }?.colorID)
+    /// Gives each item the pigment its calendar wears, if it has one.
+    private func decorated(_ items: [EventItem]) -> [EventItem] {
+        let pigments = Dictionary(extraCalendars.map { ($0.id, $0.colorID) }, uniquingKeysWith: { first, _ in first })
+        return items.map { item in
+            var item = item
+            item.calendarColorID = pigments[item.calendarID] ?? nil
+            return item
+        }
     }
 
     /// What is on a calendar over the next month, soonest first — how the
     /// first-launch picker makes calendars recognisable by their contents.
-    func upcoming(on calendar: EKCalendar, days: Int = 30) -> [EventItem] {
-        guard access == .granted else { return [] }
+    func upcoming(on calendar: CalendarInfo, days: Int = 30) -> [EventItem] {
+        guard access == .granted, let provider else { return [] }
         let now = Date()
         let to = self.calendar.date(byAdding: .day, value: days, to: now) ?? now
-        let predicate = store.predicateForEvents(withStart: now, end: to, calendars: [calendar])
-        return store.events(matching: predicate)
-            .sorted { $0.startDate < $1.startDate }
-            .map(makeItem)
+        return decorated(provider.events(from: now, to: to, in: [calendar])
+            .filter { $0.end > now }
+            .sorted { $0.start < $1.start })
     }
 
     /// Every event on one connected calendar across the search window, shown
     /// or not — what a calendar-wide colour change has to reach.
     func allItems(on extra: ExtraCalendar) -> [EventItem] {
-        guard access == .granted, let calendar = resolve(extra.ref) else { return [] }
+        guard access == .granted, let provider, let calendar = resolve(extra.ref) else { return [] }
         let from = self.calendar.date(byAdding: .year, value: -2, to: Date()) ?? Date()
         let to = self.calendar.date(byAdding: .year, value: 2, to: Date()) ?? Date()
-        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: [calendar])
-        return store.events(matching: predicate).map(makeItem)
+        return decorated(provider.events(from: from, to: to, in: [calendar]))
     }
 
     // MARK: - Loading
@@ -405,7 +546,7 @@ final class EventStore: ObservableObject {
     /// Fetch a little past the visible span, so scrolling or a quick step to the
     /// next period has something to draw immediately.
     func reload() {
-        guard access == .granted, let calendar = targetCalendar else {
+        guard access == .granted, let provider, let calendar = targetCalendar else {
             items = []
             itemsByDay = [:]
             return
@@ -414,10 +555,7 @@ final class EventStore: ObservableObject {
         let from = self.calendar.date(byAdding: .day, value: -7, to: span.start) ?? span.start
         let to = self.calendar.date(byAdding: .day, value: 7, to: span.end) ?? span.end
 
-        let predicate = store.predicateForEvents(withStart: from, end: to,
-                                                 calendars: visibleCalendars(calendar))
-        items = store.events(matching: predicate)
-            .map(makeItem)
+        items = decorated(provider.events(from: from, to: to, in: visibleCalendars(calendar)))
             .filter { showFilteredEvents || !Categories.isFilteredOut($0) }
             .sorted { lhs, rhs in
                 if lhs.isAllDay != rhs.isAllDay { return lhs.isAllDay }
@@ -462,23 +600,13 @@ final class EventStore: ObservableObject {
     @discardableResult
     func create(title: String, start: Date, end: Date, isAllDay: Bool,
                 location: String, notes: String,
-                recurrence: EKRecurrenceRule? = nil) throws -> String? {
-        guard let calendar = targetCalendar else { throw StoreError.missingCalendar }
-        let event = EKEvent(eventStore: store)
-        event.calendar = calendar
-        event.title = title
-        event.startDate = start
-        event.endDate = end
-        event.isAllDay = isAllDay
-        event.location = location.isEmpty ? nil : location
-        event.notes = notes.isEmpty ? nil : notes
-        if let recurrence { event.recurrenceRules = [recurrence] }
-        // A repeating event has to be saved across the series, not just the
-        // first occurrence, or EventKit drops the rule.
-        try store.save(event, span: recurrence == nil ? .thisEvent : .futureEvents, commit: true)
-        corpusIsStale = true
-        reload()
-        return event.eventIdentifier
+                recurrence: EKRecurrenceRule? = nil) async throws -> String? {
+        guard let provider, let calendar = targetCalendar else { throw StoreError.missingCalendar }
+        let fields = EventFields(title: title, start: start, end: end, isAllDay: isAllDay,
+                                 location: location, notes: notes)
+        let seriesID = try await provider.create(fields, recurrence: recurrence, in: calendar)
+        changed()
+        return seriesID
     }
 
     /// Repeating events are changed for this and all later occurrences —
@@ -491,60 +619,54 @@ final class EventStore: ObservableObject {
     func update(_ item: EventItem, title: String, start: Date, end: Date,
                 isAllDay: Bool, location: String, notes: String,
                 recurrence: RecurrenceEdit = .unchanged,
-                span: EKSpan? = nil) throws -> String? {
-        let event = item.ekEvent
-        event.title = title
-        event.startDate = start
-        event.endDate = end
-        event.isAllDay = isAllDay
-        event.location = location.isEmpty ? nil : location
-        event.notes = notes.isEmpty ? nil : notes
-        var nowRepeats = item.isRecurring
-        switch recurrence {
-        case .unchanged:
-            break
-        case .clear:
-            event.recurrenceRules = nil
-            nowRepeats = item.isRecurring        // still a series edit to clear it
-        case .set(let rule):
-            event.recurrenceRules = [rule]
-            nowRepeats = true
-        }
-        let repeating = nowRepeats
-        try store.save(event, span: span ?? (repeating ? .futureEvents : .thisEvent), commit: true)
-        corpusIsStale = true
-        reload()
-        return event.eventIdentifier
+                span: EKSpan? = nil) async throws -> String? {
+        guard let provider else { throw StoreError.missingCalendar }
+        var repeating = item.isRecurring        // still a series edit to clear it
+        if case .set = recurrence { repeating = true }
+        let fields = EventFields(title: title, start: start, end: end, isAllDay: isAllDay,
+                                 location: location, notes: notes)
+        let savedID = try await provider.update(item, to: fields, recurrence: recurrence,
+                                                span: span ?? (repeating ? .futureEvents : .thisEvent))
+        changed()
+        return savedID
     }
 
-    func delete(_ item: EventItem, span: EKSpan? = nil) throws {
-        let scope = span ?? (item.isRecurring ? .futureEvents : .thisEvent)
-        try store.remove(item.ekEvent, span: scope, commit: true)
+    func delete(_ item: EventItem, span: EKSpan? = nil) async throws {
+        guard let provider else { throw StoreError.missingCalendar }
+        try await provider.delete(item, span: span ?? (item.isRecurring ? .futureEvents : .thisEvent))
+        changed()
+    }
+
+    private func changed() {
         corpusIsStale = true
         reload()
     }
 
     /// Whether any of a series is left. Deleting "this and later" from partway
     /// through keeps the earlier occurrences, and with them their colour.
-    func seriesExists(_ seriesID: String) -> Bool {
-        store.event(withIdentifier: seriesID) != nil
+    func seriesExists(_ item: EventItem) async -> Bool {
+        await provider?.seriesExists(item) ?? false
     }
 
-    /// One occurrence of a repeating event, by the day it falls on.
-    ///
-    /// EventKit hands back a distinct `EKEvent` per occurrence, and holding the
-    /// right one is what makes a `.thisEvent` edit affect a single date instead
-    /// of the whole series.
-    func occurrence(ofSeries seriesID: String, on day: Date) -> EventItem? {
-        allKnownItems().first {
-            $0.seriesID == seriesID && calendar.isDate($0.start, inSameDayAs: day)
-        }
+    /// One occurrence of a repeating event, by the day it falls on, read fresh
+    /// — holding the right one is what makes a single-date edit affect that
+    /// date instead of the whole series.
+    func occurrence(of item: EventItem, on day: Date) async -> EventItem? {
+        guard let found = await provider?.occurrence(of: item, on: day) else { return nil }
+        return decorated([found]).first
+    }
+
+    /// The event as the calendar has it now, or nil if it has since been
+    /// deleted.
+    func current(_ item: EventItem) async -> EventItem? {
+        guard let found = await provider?.current(item) else { return nil }
+        return decorated([found]).first
     }
 
     enum StoreError: LocalizedError {
         case missingCalendar
         var errorDescription: String? {
-            "The calendar Chroma uses isn't on this Mac any more. Choose another in Settings."
+            "The calendar Chroma uses can't be found any more. Choose another in Settings."
         }
     }
 
@@ -559,12 +681,10 @@ final class EventStore: ObservableObject {
     private var corpusIsStale = true
 
     private func buildCorpusIfNeeded() {
-        guard corpusIsStale, access == .granted, let target = targetCalendar else { return }
+        guard corpusIsStale, access == .granted, let provider, let target = targetCalendar else { return }
         let from = calendar.date(byAdding: .year, value: -2, to: Date()) ?? Date()
         let to = calendar.date(byAdding: .year, value: 2, to: Date()) ?? Date()
-        let predicate = store.predicateForEvents(withStart: from, end: to,
-                                                 calendars: visibleCalendars(target))
-        corpus = store.events(matching: predicate).map(makeItem)
+        corpus = decorated(provider.events(from: from, to: to, in: visibleCalendars(target)))
         corpusIsStale = false
     }
 

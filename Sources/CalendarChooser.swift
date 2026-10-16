@@ -1,4 +1,4 @@
-import EventKit
+import AppKit
 import SwiftUI
 
 /// One calendar as the picker shows it: its name, its colour, and what is on
@@ -29,22 +29,39 @@ struct ChooserSection: Identifiable {
 }
 
 /// Stands in for the calendar until there is one to show: on first launch,
-/// and if the chosen calendar disappears from this Mac.
+/// and if the chosen calendar disappears.
 struct CalendarChooser: View {
     @EnvironmentObject var store: EventStore
     @State private var sections: [ChooserSection] = []
     @State private var selection: String?
 
+    private var source: CalendarSource { store.source ?? .apple }
+
     var body: some View {
         CalendarChooserLayout(sections: sections,
                               selection: $selection,
                               missing: store.mainCalendar,
+                              source: source,
                               onChoose: choose,
-                              onAddAccount: SystemSettings.openInternetAccounts)
+                              onAddAccount: { Self.addCalendars(for: source) },
+                              onSwitchSource: {
+                                  store.use(source == .apple ? .google : .apple)
+                              })
             .onAppear(perform: refresh)
-            // An account added in System Settings arrives as a store change.
-            .onReceive(NotificationCenter.default.publisher(for: .EKEventStoreChanged)
-                .receive(on: DispatchQueue.main)) { _ in refresh() }
+            // An account added in System Settings, or a Google calendar's
+            // events arriving, comes in as a change from the source.
+            .onChange(of: store.sourceRevision) { _, _ in refresh() }
+    }
+
+    /// Where more calendars come from: macOS's accounts, or Google Calendar
+    /// on the web.
+    static func addCalendars(for source: CalendarSource) {
+        switch source {
+        case .apple:
+            SystemSettings.openInternetAccounts()
+        case .google:
+            if let url = URL(string: "https://calendar.google.com") { NSWorkspace.shared.open(url) }
+        }
     }
 
     /// Fetched here rather than in the layout's body, which re-runs on every
@@ -54,33 +71,34 @@ struct CalendarChooser: View {
             ChooserSection(id: group.id, account: group.account, calendars: group.calendars.map { calendar in
                 let upcoming = store.upcoming(on: calendar)
                 return ChooserCalendar(
-                    id: calendar.calendarIdentifier,
+                    id: calendar.id,
                     title: calendar.title,
-                    color: Color(cgColor: calendar.cgColor),
+                    color: calendar.color,
                     upcomingCount: upcoming.count,
                     next: upcoming.prefix(3).map {
                         ChooserEvent(id: $0.id, title: $0.title, start: $0.start, isAllDay: $0.isAllDay)
                     })
             })
         }
-        // Start on the calendar macOS creates in by default — usually the right
-        // answer, and never a surprise.
+        // Start on the calendar the source creates in by default — macOS's
+        // default, or Google's primary — usually the right answer, and never
+        // a surprise.
         let ids = sections.flatMap(\.calendars).map(\.id)
         if selection == nil || !ids.contains(selection!) {
-            let preferred = store.systemDefaultCalendar?.calendarIdentifier
+            let preferred = store.defaultCalendarID
             selection = preferred.flatMap { ids.contains($0) ? $0 : nil } ?? ids.first
         }
     }
 
     private func choose(_ id: String) {
         let calendars = store.calendarGroups(writableOnly: true).flatMap(\.calendars)
-        if let chosen = calendars.first(where: { $0.calendarIdentifier == id }) {
+        if let chosen = calendars.first(where: { $0.id == id }) {
             store.useAsMain(chosen)
         }
     }
 }
 
-/// The picker itself, apart from EventKit so it can be drawn from any data.
+/// The picker itself, apart from the store so it can be drawn from any data.
 ///
 /// Set like the rest of the app: a serif heading, account names as eyebrows,
 /// counts and times in monospace. Calendars wear their colour as a swatch;
@@ -91,8 +109,10 @@ struct CalendarChooserLayout: View {
     @Binding var selection: String?
     /// The calendar that was in use, when it has disappeared. Nil on first launch.
     let missing: CalendarRef?
+    let source: CalendarSource
     let onChoose: (String) -> Void
     let onAddAccount: () -> Void
+    let onSwitchSource: () -> Void
 
     @FocusState private var listFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -113,12 +133,13 @@ struct CalendarChooserLayout: View {
                 .padding(.top, 6)
 
             if sections.isEmpty {
-                Button("Open Internet Accounts", action: onAddAccount)
+                Button(addLabel, action: onAddAccount)
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.accent)
                     .controlSize(.large)
                     .keyboardShortcut(.defaultAction)
                     .padding(.top, 20)
+                switchLink.padding(.top, 14)
             } else {
                 list.padding(.top, 20)
                 footer.padding(.top, 14)
@@ -133,19 +154,38 @@ struct CalendarChooserLayout: View {
     }
 
     private var heading: String {
-        if sections.isEmpty { return "Add a calendar account" }
+        if sections.isEmpty { return source == .apple ? "Add a calendar account" : "Make a calendar in Google" }
         return missing == nil ? "Choose your main calendar" : "Choose a new main calendar"
     }
 
     private var detail: String {
         if sections.isEmpty {
-            return "Chroma shows the calendars this Mac syncs, and none of them can take new events yet. Add an iCloud, Google, Exchange or CalDAV account in System Settings — it appears here as soon as it syncs."
+            return source == .apple
+                ? "Chroma shows the calendars this Mac syncs, and none of them can take new events yet. Add an iCloud, Google, Exchange or CalDAV account in System Settings — it appears here as soon as it syncs."
+                : "This Google account has no calendar Chroma can add events to. Make one in Google Calendar — it appears here within a couple of minutes."
         }
         if let missing {
             let account = missing.account.isEmpty ? "" : " on \(missing.account)"
-            return "\u{201C}\(missing.title)\u{201D}\(account) isn't on this Mac any more. Choose another, or add its account back in System Settings."
+            return source == .apple
+                ? "\u{201C}\(missing.title)\u{201D}\(account) isn't on this Mac any more. Choose another, or add its account back in System Settings."
+                : "\u{201C}\(missing.title)\u{201D} isn't in your Google account any more. Choose another."
         }
         return "New events go here, and it's the only calendar Claude can change. You can show others alongside it later, from Settings."
+    }
+
+    private var addLabel: String {
+        source == .apple ? "Open Internet Accounts" : "Open Google Calendar"
+    }
+
+    /// Back to the other source, for someone who picked the wrong one.
+    private var switchLink: some View {
+        Button(action: onSwitchSource) {
+            Text(source == .apple ? "Use Google Calendar instead" : "Use Apple Calendar instead")
+                .font(Theme.ui(11.5))
+                .foregroundStyle(Theme.graphite)
+                .underline(color: Theme.rule)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - List
@@ -218,13 +258,17 @@ struct CalendarChooserLayout: View {
     private var footer: some View {
         HStack(spacing: 12) {
             Button(action: onAddAccount) {
-                Text("Open Internet Accounts")
+                Text(addLabel)
                     .font(Theme.ui(11.5))
                     .foregroundStyle(Theme.graphite)
                     .underline(color: Theme.rule)
             }
             .buttonStyle(.plain)
-            .help("Add an iCloud, Google, Exchange or CalDAV account in System Settings")
+            .help(source == .apple
+                  ? "Add an iCloud, Google, Exchange or CalDAV account in System Settings"
+                  : "Make or subscribe to calendars in Google Calendar on the web")
+
+            switchLink
 
             Spacer(minLength: 12)
 

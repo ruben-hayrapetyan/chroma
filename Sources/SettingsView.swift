@@ -1,9 +1,9 @@
 import AppKit
-import EventKit
 import SwiftUI
+import UniformTypeIdentifiers
 
-/// Chroma › Settings: which calendar is home, which others are drawn beside
-/// it, and where the category rules live.
+/// Chroma › Settings: where the calendars come from, which one is home, which
+/// others are drawn beside it, and where the category rules live.
 struct SettingsView: View {
     var body: some View {
         TabView {
@@ -17,8 +17,8 @@ struct SettingsView: View {
 }
 
 enum SystemSettings {
-    /// Where calendar accounts are added. Chroma never signs in to anything
-    /// itself — it shows what macOS already syncs.
+    /// Where accounts are added for Apple Calendar, which shows what macOS
+    /// already syncs.
     static func openInternetAccounts() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension") {
             NSWorkspace.shared.open(url)
@@ -32,22 +32,28 @@ struct CalendarSettings: View {
     @EnvironmentObject var store: EventStore
     @EnvironmentObject var colors: EventColors
 
+    @State private var clientProblem: String?
+
+    private var source: CalendarSource { store.source ?? .apple }
+
     var body: some View {
-        let mainID = store.targetCalendar?.calendarIdentifier
+        let mainID = store.targetCalendar?.id
         let others = store.calendarGroups().compactMap { group -> CalendarGroup? in
-            let rest = group.calendars.filter { $0.calendarIdentifier != mainID }
+            let rest = group.calendars.filter { $0.id != mainID }
             return rest.isEmpty ? nil : CalendarGroup(id: group.id, account: group.account, calendars: rest)
         }
         let missing = store.extraCalendars.filter { store.resolve($0.ref) == nil }
 
         Form {
+            sourceSection
+
             Section {
                 Picker("Main calendar", selection: mainSelection) {
                     if mainID == nil { Text("None").tag("") }
                     ForEach(store.calendarGroups(writableOnly: true)) { group in
                         Section(group.account) {
-                            ForEach(group.calendars, id: \.calendarIdentifier) { calendar in
-                                Text(calendar.title).tag(calendar.calendarIdentifier)
+                            ForEach(group.calendars) { calendar in
+                                Text(calendar.title).tag(calendar.id)
                             }
                         }
                     }
@@ -68,14 +74,14 @@ struct CalendarSettings: View {
 
             ForEach(others) { group in
                 Section(group.account) {
-                    ForEach(group.calendars, id: \.calendarIdentifier) { calendar in
+                    ForEach(group.calendars) { calendar in
                         row(calendar)
                     }
                 }
             }
 
             if !missing.isEmpty {
-                Section("Not on this Mac") {
+                Section(source == .apple ? "Not on this Mac" : "Not in your Google account") {
                     ForEach(missing) { extra in
                         HStack {
                             Text(extra.ref.title)
@@ -88,42 +94,119 @@ struct CalendarSettings: View {
             }
 
             Section {
-                Button("Open Internet Accounts…", action: SystemSettings.openInternetAccounts)
+                Button(source == .apple ? "Open Internet Accounts…" : "Open Google Calendar") {
+                    CalendarChooser.addCalendars(for: source)
+                }
             } footer: {
-                Text("Don't see a calendar? Add its account — iCloud, Google, Exchange, or any CalDAV server — in System Settings, and it appears here.")
+                Text(source == .apple
+                     ? "Don't see a calendar? Add its account — iCloud, Google, Exchange, or any CalDAV server — in System Settings, and it appears here."
+                     : "Don't see a calendar? Make it or subscribe to it in Google Calendar, and it appears here within a couple of minutes.")
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
     }
 
+    // MARK: - Source
+
+    private var sourceSection: some View {
+        Section {
+            Picker("Calendars from", selection: Binding(get: { source }, set: { store.use($0) })) {
+                ForEach(CalendarSource.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            if source == .google { googleAccount }
+        } header: {
+            Text("Source")
+        } footer: {
+            Text(source == .apple
+                 ? "Every account this Mac syncs — iCloud, Google, Exchange, CalDAV — through macOS, the way Calendar.app sees them."
+                 : "One Google account, straight from Google. Chroma checks for changes every couple of minutes, and whenever you switch back to it.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var googleAccount: some View {
+        if !store.hasGoogleClient {
+            LabeledContent("Google client") {
+                Button("Choose Client File…", action: chooseClientFile)
+            }
+            Text("Google only lets an app reach your calendar through a client registered in Google Cloud. Make a Desktop client there, download its JSON, and choose it here — the README has the steps.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let clientProblem {
+                Label(clientProblem, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+        } else if store.access == .granted, let account = store.googleAccount {
+            LabeledContent("Account") {
+                HStack {
+                    Text(account).textSelection(.enabled)
+                    Button("Sign Out") { store.signOutOfGoogle() }
+                }
+            }
+        } else {
+            LabeledContent("Account") {
+                if store.signingIn {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel") { store.cancelGoogleSignIn() }
+                    }
+                } else {
+                    Button("Sign In with Google…") { store.signInToGoogle() }
+                }
+            }
+            if let problem = store.signInProblem {
+                Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+        }
+        if let problem = store.syncProblem {
+            Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+        }
+    }
+
+    private func chooseClientFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.message = "Choose the client JSON you downloaded from Google Cloud Console"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try store.installGoogleClient(from: url)
+            clientProblem = nil
+        } catch {
+            clientProblem = error.localizedDescription
+        }
+    }
+
     private var mainSelection: Binding<String> {
         Binding(
-            get: { store.targetCalendar?.calendarIdentifier ?? "" },
+            get: { store.targetCalendar?.id ?? "" },
             set: { id in
                 let calendars = store.calendarGroups(writableOnly: true).flatMap(\.calendars)
-                if let chosen = calendars.first(where: { $0.calendarIdentifier == id }) {
+                if let chosen = calendars.first(where: { $0.id == id }) {
                     store.useAsMain(chosen)
                 }
             }
         )
     }
 
-    private func row(_ calendar: EKCalendar) -> some View {
-        let extra = store.extraCalendars.first { $0.id == calendar.calendarIdentifier }
+    private func row(_ calendar: CalendarInfo) -> some View {
+        let extra = store.extraCalendars.first { $0.id == calendar.id }
         return HStack(spacing: 8) {
             Toggle(isOn: Binding(
                 get: { extra != nil },
-                set: { $0 ? store.connect(calendar) : store.disconnect(calendar.calendarIdentifier) }
+                set: { $0 ? store.connect(calendar) : store.disconnect(calendar.id) }
             )) {
                 HStack(spacing: 7) {
                     Circle()
-                        .fill(Color(cgColor: calendar.cgColor))
+                        .fill(calendar.color)
                         .frame(width: 8, height: 8)
                     Text(calendar.title)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if !calendar.allowsContentModifications {
+                    if !calendar.isWritable {
                         Text("Read-only")
                             .font(.caption)
                             .foregroundStyle(.secondary)

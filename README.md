@@ -4,8 +4,8 @@
 
 # Chroma
 
-A macOS calendar over EventKit, with the one feature Apple's own app refuses
-to have: per-event colours. Day, week, month and year views. Builds with the
+A macOS calendar over Apple Calendar or Google Calendar, with the one feature
+Apple's own app refuses to have: per-event colours. Day, week, month and year views. Builds with the
 Swift compiler from the Command Line Tools — no Xcode project, no
 dependencies.
 
@@ -17,13 +17,18 @@ dependencies.
 
 - **A Mac running macOS 14 Sonoma or later** — Apple silicon or Intel.
   Chroma is Mac-only: there is no iPhone, iPad, Windows, Linux or web version.
-  It's built entirely on macOS frameworks — EventKit for the calendar data,
-  SwiftUI and AppKit for the interface, Carbon for the system-wide shortcuts —
-  and earlier versions of macOS won't open it, because the calendar-access API
-  it relies on arrived in Sonoma.
-- **Your calendars set up in macOS.** Chroma shows what your Mac already syncs.
-  Add iCloud, Google, Exchange or CalDAV accounts in **System Settings ›
-  Internet Accounts**. If a calendar appears in Calendar.app, Chroma can show it.
+  It's built entirely on macOS frameworks — EventKit or Google's Calendar API
+  for the calendar data, SwiftUI and AppKit for the interface, Carbon for the
+  system-wide shortcuts — and earlier versions of macOS won't open it, because
+  the calendar-access API it relies on arrived in Sonoma.
+- **Your calendars, from one of two places.** On first launch Chroma asks where
+  they are:
+  - **Apple Calendar** shows what your Mac already syncs. Add iCloud, Google,
+    Exchange or CalDAV accounts in **System Settings › Internet Accounts**; if a
+    calendar appears in Calendar.app, Chroma can show it.
+  - **Google Calendar** signs in to one Google account and talks to Google
+    directly, with nothing added to macOS. It needs an OAuth client from Google
+    Cloud — see [Google Calendar](#google-calendar) for the five-minute setup.
 - **Optional: [Claude Code](https://claude.com/claude-code)**, for Ask Claude.
   Everything else works without it. If Ask Claude says your copy is too old,
   run `claude update`.
@@ -40,10 +45,12 @@ dependencies.
    Settings › Privacy & Security**, scroll down to **Security**, and click
    **Open Anyway** next to Chroma. You only do this once. (Or, in Terminal:
    `xattr -dr com.apple.quarantine /Applications/Chroma.app`.)
-3. **Allow calendar access** when Chroma asks.
-4. **Choose your main calendar** — the one new events go to. If yours isn't
-   listed, add its account in **System Settings › Internet Accounts** and it
-   appears.
+3. **Choose where your calendars are** — Apple Calendar or Google Calendar.
+4. **Allow calendar access** when macOS asks, or **sign in to Google** in your
+   browser.
+5. **Choose your main calendar** — the one new events go to. If yours isn't
+   listed, add its account in **System Settings › Internet Accounts** (Apple
+   Calendar) or make it in Google Calendar (Google), and it appears.
 
 That's it. Right-click any event to give it a colour, or press `⌥Space` from
 any app to add one. When you're ready for more, **Chroma › Settings** (`⌘,`)
@@ -76,13 +83,22 @@ a different app.
 `./release.sh` builds and packages `build/Chroma.zip` for a GitHub release,
 archived with `ditto` so the signature survives the download.
 
+`GOOGLE_CLIENT_JSON=path/to/client.json ./build.sh` builds a Google OAuth client
+into the app, so Google Calendar works without anyone choosing a client file.
+Without it, the app reads the client from Application Support instead (see
+[Google Calendar](#google-calendar)). The client never goes in the repository.
+
 ## What it does
 
-**Your calendars, whichever account they're on.** Chroma never signs in to
-anything. It reads the calendars macOS already syncs — iCloud, Google, Exchange,
-any CalDAV server — so connecting an account means adding it in **System
-Settings › Internet Accounts**, then granting Chroma calendar access when it
-asks.
+**Your calendars, from Apple Calendar or Google.** With **Apple Calendar**,
+Chroma signs in to nothing: it reads the calendars macOS already syncs — iCloud,
+Google, Exchange, any CalDAV server — so connecting an account means adding it
+in **System Settings › Internet Accounts**, then granting Chroma calendar access
+when it asks. With **Google Calendar**, Chroma signs in to one Google account
+and reads and changes its calendars through Google's API. First launch asks
+which; **Settings › Calendars › Calendars from** switches at any time. Each
+source keeps its own main and connected calendars, so switching back finds them
+as you left them.
 
 On first launch Chroma asks which calendar is your **main calendar**: the one
 new events go to, and the only one Claude can change. Change it later in
@@ -102,11 +118,14 @@ Edit or Delete. Give a connected calendar a colour and every event on it takes
 that pigment, ahead of the category rules — for calendars whose titles say
 nothing about what kind of event they are.
 
-**Live in both directions.** There is no sync layer, because there is nothing to
-sync: the app talks to the same EventKit database Calendar.app does. An event
-added here shows up in Calendar.app and on your other devices; an event added there — or by
-Claude, or arriving from another device — appears here the moment it lands. The
-app listens for `EKEventStoreChanged` and reloads.
+**Live in both directions.** With Apple Calendar there is no sync layer, because
+there is nothing to sync: the app talks to the same EventKit database
+Calendar.app does. An event added here shows up in Calendar.app and on your
+other devices; an event added there — or by Claude, or arriving from another
+device — appears here the moment it lands. The app listens for
+`EKEventStoreChanged` and reloads. With Google Calendar, changes made here go to
+Google first and are read back from it; changes made elsewhere arrive within
+two minutes, or as soon as you switch back to Chroma.
 
 **Four views.** Day and week share one hour grid, with overlapping events packed
 into columns the way Google Calendar does it and a live "now" line. Month is a
@@ -200,14 +219,18 @@ editable in the pane, and colour applies the moment you pick it. There is no
 modal sheet anywhere in the app — a sheet would cover the calendar, which is the
 thing you want in view while moving an event's time.
 
-**Per-event colours.** EventKit has no per-event colour, so these live in a
-sidecar at `~/Library/Application Support/Chroma/colors.json`, keyed by the
-event's identifier. Two consequences, neither avoidable:
+**Per-event colours.** EventKit has no per-event colour, and Google's has only
+eleven, so these live in a sidecar at
+`~/Library/Application Support/Chroma/colors.json`, keyed by the event's
+identifier. Three consequences:
 
-- Colours are local to this Mac. They do not reach iCloud, your iPhone, or
-  Calendar.app.
+- Colours are local to this Mac. They do not reach iCloud, Google, your iPhone,
+  or Calendar.app.
 - A repeating event takes one colour for the whole series, since every
   occurrence shares an identifier.
+- Apple Calendar and Google identify the same event differently, so a colour
+  picked by hand under one source doesn't follow it to the other. The category
+  rules colour both.
 
 Set one in the event editor, or right-click any event anywhere in the app.
 **Unmarked** is a choice like any other, and the category rules leave it alone.
@@ -265,8 +288,9 @@ shell profile (`ANTHROPIC_API_KEY` in `~/.zshrc`) won't reach it: apps opened
 from Finder don't read shell profiles, so Chroma's copy of the CLI never sees
 the variable.
 
-**What leaves your Mac.** Ask Claude is the only part of Chroma that sends
-anything anywhere. Each request includes the snapshot below — the title, time,
+**What leaves your Mac.** Apart from Google Calendar mode talking to Google,
+Ask Claude is the only part of Chroma that sends anything anywhere. Each request
+includes the snapshot below — the title, time,
 location and category of every event on the calendars being shown, five months
 back to seven ahead — and goes to Anthropic through the CLI, under your
 account's terms. Event notes are not included. Nothing is sent until you press
@@ -287,7 +311,7 @@ plan:
   "recurrence":{"freq":"weekly","interval":1,"byDay":["TU"],"until":"2026-12-19"}}]}
 ```
 
-Chroma applies that through EventKit and lists what changed. If the reply has
+Chroma applies that itself, to Apple Calendar or Google, and lists what changed. If the reply has
 no plan, or one Chroma can't read, nothing is applied and the panel says so:
 Claude's sentence alone doesn't mean anything changed. A request you stop, or
 one still running after three minutes, is stopped without applying anything.
@@ -313,11 +337,67 @@ occurrence on, so its past stays as it was. A calendar that still runs past 400
 lines keeps the 400 events nearest the day in view, and the prompt tells Claude
 where the list stops.
 
+## Google Calendar
+
+Google only lets an app reach someone's calendar through an OAuth client
+registered in Google Cloud. Chroma doesn't ship one, so the first time you pick
+Google Calendar it asks for yours. Making it takes about five minutes, once:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create a
+   project — any name.
+2. **APIs & Services › Library**: find **Google Calendar API** and enable it.
+3. **Google Auth Platform › Branding**: fill in an app name ("Chroma") and your
+   email. Under **Audience**, choose **External**, and add your own Google
+   address as a test user.
+4. **Clients › Create client**: application type **Desktop app**. Download its
+   JSON.
+5. In Chroma, **Choose Client File…** on the sign-in screen (or in **Settings ›
+   Calendars**), pick that JSON, then **Sign In with Google**.
+
+Chroma copies the file to
+`~/Library/Application Support/Chroma/google-client.json`. It asks Google for
+two permissions only: seeing your calendar list, and seeing and editing events.
+It can't delete calendars or change who they're shared with.
+
+While the project's **Audience** is in **Testing**, Google ends the sign-in
+after seven days and Chroma asks you to sign in again. **Publish app** on the
+Audience page stops that; Google then shows a "Google hasn't verified this app"
+screen at sign-in, which **Advanced › Go to Chroma** gets past — it's your own
+app, unverified because nobody has reviewed it. A university or company account
+may refuse unverified apps outright; that's the administrator's setting.
+
+**How it signs in.** Your browser does the signing in, so Chroma never sees your
+password. Google sends the browser back to a one-off listener on `127.0.0.1`,
+which only this Mac can reach, and PKCE ties the code it carries to this one
+sign-in. The lasting part of the sign-in is kept in your login keychain as
+"Chroma — Google Calendar", never in a file. Because builds are ad-hoc signed,
+macOS asks once after each update whether Chroma may read it — choose **Always
+Allow**. **Settings › Calendars › Sign Out** removes it and tells Google to
+revoke it.
+
+**How it stays current.** Chroma keeps a copy of the calendars in use, two years
+either side of today, and draws from that. Every two minutes, and whenever you
+switch back to it, it asks Google whether anything changed — a single tiny
+request per calendar — and fetches a calendar again only when something did.
+Offline, it shows what it last fetched and says so under the wordmark.
+
+**Repeating events.** "This and all later occurrences" works the way Google
+Calendar itself does it: from the first occurrence it changes the whole series;
+from partway through, it ends the series the day before and starts a new one
+with the change. Single dates changed by Ask Claude become exceptions within
+the series, as they would on the web.
+
 ## Layout
 
 | File | Holds |
 | --- | --- |
-| `Sources/EventStore.swift` | EventKit access, main and connected calendars, fetching, create/update/delete, search ranking |
+| `Sources/EventStore.swift` | The chosen source, main and connected calendars, fetching, create/update/delete, search ranking |
+| `Sources/CalendarProvider.swift` | What a source provides — the seam between the app and Apple Calendar or Google |
+| `Sources/AppleCalendars.swift` | Apple Calendar, through EventKit |
+| `Sources/GoogleCalendars.swift` | Google Calendar: the API calls, the local copy, checking for changes, splitting a series |
+| `Sources/GoogleAuth.swift` | Google sign-in: the browser, the loopback redirect, the keychain |
+| `Sources/RRule.swift` | Repeat rules to and from the text form Google stores |
+| `Sources/SourceChooser.swift` | The first-launch source choice and the Google sign-in screen |
 | `Sources/Categories.swift` | Loading `categories.json`, matching, the filter, and the colouring pass |
 | `Sources/SettingsView.swift` | Settings window — main and connected calendars, the categories file |
 | `Sources/CalendarChooser.swift` | The first-launch calendar picker |
@@ -334,7 +414,7 @@ where the list stops.
 | `Sources/TimeGridView.swift` | Day and week grids |
 | `Sources/MiniMonth.swift` | Mini months and the year view |
 | `Sources/ClaudePanel.swift` | The Claude popup and its CLI runner |
-| `Sources/ClaudePlan.swift` | Parses Claude's reply and applies it through EventKit |
+| `Sources/ClaudePlan.swift` | Parses Claude's reply and applies it |
 | `Sources/GlobalHotKey.swift` | Carbon system-wide shortcuts |
 | `Sources/ChromaApp.swift` | Entry point, menus, hotkey registration |
 | `tools/MakeIcon.swift` | Renders the app icon |
@@ -344,6 +424,9 @@ where the list stops.
 
 - Editing a repeating event applies to this and all future occurrences; there is
   no "just this one".
+- Google Calendar mode uses one Google account at a time, and doesn't email
+  guests about changes — edit events with guests in Google Calendar if they
+  should hear about it.
 - No drag to move or resize an event yet — use the editor.
 - Colours are not backed up. Deleting `colors.json` resets every event to
   untagged.
